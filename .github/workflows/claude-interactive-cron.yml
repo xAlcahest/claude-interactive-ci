@@ -48,9 +48,10 @@ jobs:
           claude --version
 
       # ----- Auth ------------------------------------------------------------
-      # Store your OAuth token as a GitHub Secret named CLAUDE_OAUTH_TOKEN
-      # To get it: run `cat ~/.claude/credentials.json` on a machine where
+      # Store your Long-Lived Token as a GitHub Secret named CLAUDE_OAUTH_TOKEN
+      # To generate one: run `claude auth long-lived-token` on a machine where
       # you're logged into Claude Code with your Max subscription.
+      # The token starts with sk-ant-lltt- and lasts ~1 year.
       #
       # IMPORTANT: This uses your SUBSCRIPTION auth, not an API key.
       # An API key would bypass the whole point of this exercise.

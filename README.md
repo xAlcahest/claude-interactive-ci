@@ -22,22 +22,39 @@ This PoC demonstrates that the distinction between "interactive" and "programmat
 
 ## Setup
 
-### 1. Get your OAuth credentials
+### 1. Generate a Long-Lived Token
 
-On a machine where you're logged into Claude Code with your subscription:
+On a machine where you're logged into Claude Code with your Max/Pro subscription:
 
 ```bash
-cat ~/.claude/credentials.json
+claude auth long-lived-token
 ```
 
-Copy the entire content.
+You'll get output like this:
+
+```
+Generated long-lived token:
+sk-ant-lltt-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+
+This token:
+  - Is tied to your current Claude subscription
+  - Expires in 1 year
+  - Can be revoked at any time via `claude auth revoke`
+  - Does NOT refresh automatically like OAuth tokens
+
+Store it somewhere safe. It will not be shown again.
+```
+
+Copy the `sk-ant-lltt-...` token. Unlike the standard OAuth flow that refreshes every 12 hours and would die on you mid-cron, this one lives for a year.
 
 ### 2. Add GitHub Secret
 
 Go to your repository → Settings → Secrets and variables → Actions → New repository secret:
 
 - **Name:** `CLAUDE_OAUTH_TOKEN`  
-- **Value:** The content from step 1
+- **Value:** The `sk-ant-lltt-...` token from step 1
+
+The secret is necessary because the GitHub Actions runner is an ephemeral container with no persistent storage. It doesn't have your `~/.claude/` directory, your login session, or any idea who you are. The secret is the only way to pass auth without hardcoding it in the repo (which would be publishing your subscription token to the world on a public repo).
 
 ### 3. Enable the workflow
 
