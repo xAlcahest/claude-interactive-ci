@@ -74,16 +74,36 @@ jobs:
             "cd $GITHUB_WORKSPACE && export CLAUDE_CODE_OAUTH_TOKEN='${CLAUDE_CODE_OAUTH_TOKEN}' && export IS_SANDBOX=1 && claude --dangerously-skip-permissions --verbose; bash"
 
           echo "Waiting for Claude Code..."
-          sleep 12
-          INIT_WAIT=12
-          while [ $INIT_WAIT -lt 60 ]; do
+          sleep 10
+          INIT_WAIT=10
+          while [ $INIT_WAIT -lt 90 ]; do
             BUFFER=$(tmux capture-pane -t "$SESSION" -p 2>/dev/null || true)
 
+            # Handle trust dialog — send "1" (Yes, I trust)
+            if echo "$BUFFER" | grep -q "trust this folder"; then
+              echo "Trust dialog detected — accepting..."
+              tmux send-keys -t "$SESSION" "1" C-m
+              sleep 5
+              INIT_WAIT=$((INIT_WAIT + 5))
+              continue
+            fi
+
+            # Handle bypass permissions confirmation — send "2" (Yes, I accept)
+            if echo "$BUFFER" | grep -q "Yes, I accept"; then
+              echo "Bypass permissions dialog — accepting..."
+              tmux send-keys -t "$SESSION" "2" C-m
+              sleep 5
+              INIT_WAIT=$((INIT_WAIT + 5))
+              continue
+            fi
+
+            # Ready to go
             if echo "$BUFFER" | grep -qE '(Enter a prompt|tips:|bypass permissions on)'; then
               echo "Claude Code is ready (after ${INIT_WAIT}s)"
               break
             fi
 
+            # Login wizard = onboarding bypass failed
             if echo "$BUFFER" | grep -q "Select login method"; then
               echo "::error::Login wizard appeared — onboarding bypass failed"
               tmux capture-pane -t "$SESSION" -p
@@ -91,8 +111,8 @@ jobs:
               exit 1
             fi
 
-            sleep 2
-            INIT_WAIT=$((INIT_WAIT + 2))
+            sleep 3
+            INIT_WAIT=$((INIT_WAIT + 3))
           done
 
           if [ $INIT_WAIT -ge 60 ]; then
