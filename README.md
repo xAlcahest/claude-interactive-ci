@@ -27,25 +27,10 @@ This PoC demonstrates that the distinction between "interactive" and "programmat
 On a machine where you're logged into Claude Code with your Max/Pro subscription:
 
 ```bash
-claude auth long-lived-token
+claude setup-token
 ```
 
-You'll get output like this:
-
-```
-Generated long-lived token:
-sk-ant-lltt-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
-
-This token:
-  - Is tied to your current Claude subscription
-  - Expires in 1 year
-  - Can be revoked at any time via `claude auth revoke`
-  - Does NOT refresh automatically like OAuth tokens
-
-Store it somewhere safe. It will not be shown again.
-```
-
-Copy the `sk-ant-lltt-...` token. Unlike the standard OAuth flow that refreshes every 12 hours and would die on you mid-cron, this one lives for a year.
+Follow the prompts. It generates a long-lived authentication token tied to your Claude subscription that doesn't expire every 12 hours like the standard OAuth refresh flow. Copy the token it gives you.
 
 ### 2. Add GitHub Secret
 
