@@ -24,32 +24,33 @@ This PoC demonstrates that the distinction between "interactive" and "programmat
 
 ### 1. Generate a Long-Lived Token
 
-On a machine where you're logged into Claude Code with your Max/Pro subscription, copy the full content of the credentials file:
+On a machine where you're logged into Claude Code with your Max/Pro subscription, generate a long-lived token:
 
 ```bash
-cat ~/.claude/.credentials.json
+claude setup-token
 ```
 
-Note the dot prefix — it's a hidden file (`.credentials.json`, not `credentials.json`).
+Output:
 
-The output looks like this:
+```
+✓ Long-lived authentication token created successfully!
+Your OAuth token (valid for 1 year):
+sk-ant-oat01-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 
-```json
-{"claudeAiOauth":{"accessToken":"sk-ant-oat01-...","refreshToken":"sk-ant-ort01-...","expiresAt":1778781052648,"scopes":["user:inference","user:sessions:claude_code"],"subscriptionType":"max","rateLimitTier":"default_claude_max_20x"},"organizationUuid":"xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"}
+Store this token securely. You won't be able to see it again.
+Use this token by setting: export CLAUDE_CODE_OAUTH_TOKEN=<token>
 ```
 
-Copy the entire JSON output.
+Copy the `sk-ant-oat01-...` token. This one lasts a year.
 
 ### 2. Add GitHub Secret
 
 Go to your repository → Settings → Secrets and variables → Actions → New repository secret:
 
 - **Name:** `CLAUDE_OAUTH_TOKEN`  
-- **Value:** The entire JSON content from step 1
+- **Value:** Just the token string (`sk-ant-oat01-...`), nothing else
 
-The secret is necessary because the GitHub Actions runner is an ephemeral container with no persistent storage. It doesn't have your `~/.claude/` directory or your login session. The workflow writes this JSON to `~/.claude/.credentials.json` in the runner so Claude Code finds it at startup.
-
-> **Note:** The `accessToken` expires every ~12 hours, but the `refreshToken` is long-lived. Claude Code uses the refresh token to get new access tokens automatically.
+The workflow passes it as the `CLAUDE_CODE_OAUTH_TOKEN` environment variable inside the tmux session. No credentials files, no JSON formatting — Claude Code reads the env var directly.
 
 ### 3. Enable the workflow
 
