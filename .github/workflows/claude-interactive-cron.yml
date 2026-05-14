@@ -48,9 +48,9 @@ jobs:
           claude --version
 
       # ----- Auth ------------------------------------------------------------
-      # Store your Long-Lived Token as a GitHub Secret named CLAUDE_OAUTH_TOKEN
-      # To generate one: run `claude setup-token` on a machine where
-      # you're logged into Claude Code with your Max subscription.
+      # The secret CLAUDE_OAUTH_TOKEN must contain the FULL content of
+      # ~/.claude/.credentials.json (note the dot prefix — hidden file).
+      # Run `cat ~/.claude/.credentials.json` on your machine to get it.
       #
       # IMPORTANT: This uses your SUBSCRIPTION auth, not an API key.
       # An API key would bypass the whole point of this exercise.
@@ -60,11 +60,14 @@ jobs:
         run: |
           mkdir -p ~/.claude
 
-          # Write credentials file the same way Claude Code stores it
-          # The exact format depends on your auth method; adapt as needed
           if [ -n "$CLAUDE_OAUTH_TOKEN" ]; then
-            echo "$CLAUDE_OAUTH_TOKEN" > ~/.claude/credentials.json
+            # Write to .credentials.json (dot prefix — hidden file)
+            echo "$CLAUDE_OAUTH_TOKEN" > ~/.claude/.credentials.json
             echo "Claude auth configured from secret"
+            # Sanity check: verify it's valid JSON
+            python3 -c "import json; json.load(open('$HOME/.claude/.credentials.json'))" \
+              && echo "Credentials JSON is valid" \
+              || echo "::warning::Credentials JSON may be malformed"
           else
             echo "::error::CLAUDE_OAUTH_TOKEN secret not set"
             exit 1
