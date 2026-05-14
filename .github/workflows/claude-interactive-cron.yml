@@ -51,7 +51,7 @@ jobs:
           if [ -n "$CUSTOM" ]; then
             PROMPT="$CUSTOM"
           else
-            PROMPT="Read the file log.txt in this directory (create it if it doesn't exist). Append a new line at the end with the format: 'Run #${RUN_NUMBER} — ${TIMESTAMP} — [write a short creative observation about coding, AI, or software engineering]'. Do NOT delete existing content. Save the file. Reply with only what you added."
+            PROMPT="Do the following tasks using your tools: 1) Run 'uname -a' and 'date' in bash to get system info. 2) Run 'ls -la' to see the repo contents. 3) Read README.md and count how many lines it has. 4) Create a file called REPORT.md with a brief report containing: the system info, the file listing, the README line count, and a timestamp. 5) Append a line to log.txt with 'Run #${RUN_NUMBER} — ${TIMESTAMP} — [tool-generated entry]'. Do all of this autonomously."
           fi
 
           echo "$PROMPT" > /tmp/claude-prompt.txt
@@ -141,8 +141,8 @@ jobs:
 
             if [ "$CURRENT_HASH" = "$LAST_HASH" ]; then
               STABLE=$((STABLE + 1))
-              if [ $STABLE -ge 3 ]; then
-                echo "Output stable for 9s — Claude Code appears done (${ELAPSED}s total)"
+              if [ $STABLE -ge 4 ]; then
+                echo "Output stable for 12s — Claude Code appears done (${ELAPSED}s total)"
                 break
               fi
             else
@@ -163,7 +163,7 @@ jobs:
           sleep 2
           tmux kill-session -t "$SESSION" 2>/dev/null || true
 
-          if git diff --quiet log.txt 2>/dev/null; then
+          if git diff --quiet log.txt REPORT.md 2>/dev/null; then
             echo "::warning::log.txt was not modified"
             echo "result=failure" >> "$GITHUB_ENV"
           else
@@ -178,7 +178,7 @@ jobs:
         run: |
           git config user.name "claude-interactive-bot"
           git config user.email "bot@example.com"
-          git add log.txt
+          git add log.txt REPORT.md 2>/dev/null || git add log.txt
           if git diff --cached --quiet; then
             echo "No changes to commit"
           else
