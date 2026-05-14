@@ -1,21 +1,7 @@
-# =============================================================================
-#  claude-interactive-cron.yml
-#
-#  PoC: Run Claude Code as an "interactive session" in GitHub Actions via tmux.
-#  Appends a timestamped entry to log.txt every 6 hours.
-#
-#  This workflow spawns Claude Code inside a real PTY (via tmux),
-#  sends input as keystrokes, and waits for completion.
-#  From Claude Code's perspective, it IS an interactive session.
-#
-#  "Distinguished engineering" at its finest.
-# =============================================================================
-
 name: Claude Interactive Cron
 
 on:
   schedule:
-    # Every 6 hours: 00:00, 06:00, 12:00, 18:00 UTC
     - cron: '0 */6 * * *'
   workflow_dispatch:
     inputs:
@@ -30,48 +16,31 @@ permissions:
 jobs:
   interactive-claude:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 10
 
     steps:
-      # ----- Setup -----------------------------------------------------------
       - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Install dependencies
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq tmux jq expect
+          sudo apt-get install -y -qq tmux jq
 
       - name: Install Claude Code
         run: |
           npm install -g @anthropic-ai/claude-code@latest
           claude --version
 
-      # ----- Auth ------------------------------------------------------------
-      # Two secrets needed:
-      # 1. CLAUDE_OAUTH_TOKEN — the sk-ant-oat01-... token from `claude setup-token`
-      # 2. CLAUDE_ONBOARDING_JSON — the onboarding bypass JSON (skips login wizard)
-      - name: Configure Claude auth and onboarding
+      - name: Configure Claude auth and bypass all dialogs
         env:
-          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_OAUTH_TOKEN }}
           CLAUDE_ONBOARDING_JSON: ${{ secrets.CLAUDE_ONBOARDING_JSON }}
         run: |
-          if [ -z "$CLAUDE_CODE_OAUTH_TOKEN" ]; then
-            echo "::error::CLAUDE_OAUTH_TOKEN secret not set"
-            exit 1
-          fi
-          if [ -z "$CLAUDE_ONBOARDING_JSON" ]; then
-            echo "::error::CLAUDE_ONBOARDING_JSON secret not set"
-            exit 1
-          fi
-          echo "Auth token present (${#CLAUDE_CODE_OAUTH_TOKEN} chars)"
-
-          # Write the onboarding bypass file — THIS is the missing piece
-          # Without it, Claude Code's TUI always shows "Select login method"
           echo "$CLAUDE_ONBOARDING_JSON" > ~/.claude.json
-          echo "Onboarding bypass written to ~/.claude.json"
+          mkdir -p ~/.claude
+          echo '{"skipDangerousModePermissionPrompt": true}' > ~/.claude/settings.json
+          echo "Auth and onboarding configured"
 
-      # ----- Prepare the prompt ----------------------------------------------
       - name: Build prompt
         id: prompt
         run: |
@@ -82,49 +51,41 @@ jobs:
           if [ -n "$CUSTOM" ]; then
             PROMPT="$CUSTOM"
           else
-            PROMPT="Read the file log.txt in this directory (create it if it doesn't exist). Append a new line at the end with the format: 'Run #${RUN_NUMBER} — ${TIMESTAMP} — [write a short creative observation about coding, AI, or software engineering]'. Do NOT delete existing content. Save the file. Then run 'git add log.txt && git diff --cached --stat' to verify. Reply with only what you added."
+            PROMPT="Read the file log.txt in this directory (create it if it doesn't exist). Append a new line at the end with the format: 'Run #${RUN_NUMBER} — ${TIMESTAMP} — [write a short creative observation about coding, AI, or software engineering]'. Do NOT delete existing content. Save the file. Reply with only what you added."
           fi
 
-          # Save to file to avoid shell escaping hell
           echo "$PROMPT" > /tmp/claude-prompt.txt
           echo "prompt_file=/tmp/claude-prompt.txt" >> "$GITHUB_OUTPUT"
 
-      # ----- The main event: interactive tmux session ------------------------
       - name: Run Claude Code interactively via tmux
         env:
           TERM: xterm-256color
           ANTHROPIC_API_KEY: ""
           CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_OAUTH_TOKEN }}
+          IS_SANDBOX: "1"
         run: |
-          set +e  # Don't exit on error, we handle it ourselves
+          set +e
 
           SESSION="claude-ci-$$"
           PROMPT=$(cat "${{ steps.prompt.outputs.prompt_file }}")
-          TIMEOUT=180  # 3 minutes should be plenty for this task
+          TIMEOUT=180
 
-          echo "=== Starting tmux session: $SESSION ==="
-
-          # Launch Claude Code directly as tmux session command with env var
           tmux new-session -d -s "$SESSION" -x 200 -y 50 \
-            "cd $GITHUB_WORKSPACE && export CLAUDE_CODE_OAUTH_TOKEN='${CLAUDE_CODE_OAUTH_TOKEN}' && claude --verbose; bash"
+            "cd $GITHUB_WORKSPACE && export CLAUDE_CODE_OAUTH_TOKEN='${CLAUDE_CODE_OAUTH_TOKEN}' && export IS_SANDBOX=1 && claude --dangerously-skip-permissions --verbose; bash"
 
-          # Wait for Claude Code to initialize
-          # With onboarding bypass in ~/.claude.json, it should skip the login wizard
-          echo "Waiting for Claude Code to start..."
-          sleep 8
-          INIT_WAIT=8
+          echo "Waiting for Claude Code..."
+          sleep 12
+          INIT_WAIT=12
           while [ $INIT_WAIT -lt 60 ]; do
             BUFFER=$(tmux capture-pane -t "$SESSION" -p 2>/dev/null || true)
 
-            # Check if we hit the prompt (ready to accept input)
-            if echo "$BUFFER" | grep -qE '(Enter a prompt|tips:|❯)'; then
+            if echo "$BUFFER" | grep -qE '(Enter a prompt|tips:|bypass permissions on)'; then
               echo "Claude Code is ready (after ${INIT_WAIT}s)"
               break
             fi
 
-            # Detect if login screen appeared despite onboarding bypass
             if echo "$BUFFER" | grep -q "Select login method"; then
-              echo "::error::Onboarding bypass failed — login wizard still showing"
+              echo "::error::Login wizard appeared — onboarding bypass failed"
               tmux capture-pane -t "$SESSION" -p
               tmux kill-session -t "$SESSION" 2>/dev/null || true
               exit 1
@@ -141,13 +102,11 @@ jobs:
             exit 1
           fi
 
-          # Send the prompt as keystrokes (exactly like a human typing)
           echo "Sending prompt..."
-          tmux send-keys -t "$SESSION" -l "$PROMPT"
-          sleep 0.5
-          tmux send-keys -t "$SESSION" Enter
+          tmux send-keys -t "$SESSION" "$PROMPT"
+          sleep 0.3
+          tmux send-keys -t "$SESSION" C-m
 
-          # Wait for Claude to finish
           echo "Waiting for Claude Code to complete..."
           ELAPSED=0
           LAST_HASH=""
@@ -163,7 +122,7 @@ jobs:
             if [ "$CURRENT_HASH" = "$LAST_HASH" ]; then
               STABLE=$((STABLE + 1))
               if [ $STABLE -ge 3 ]; then
-                echo "Output stable for 9s — Claude Code appears done"
+                echo "Output stable for 9s — Claude Code appears done (${ELAPSED}s total)"
                 break
               fi
             else
@@ -176,37 +135,30 @@ jobs:
             fi
           done
 
-          # Capture final output
           echo "=== Final tmux buffer ==="
           tmux capture-pane -t "$SESSION" -p -S -200 | tee /tmp/claude-output.txt
           echo "========================="
 
-          # Send /exit to Claude Code gracefully
-          tmux send-keys -t "$SESSION" "/exit" Enter
+          tmux send-keys -t "$SESSION" "/exit" C-m
           sleep 2
-
-          # Kill tmux session
           tmux kill-session -t "$SESSION" 2>/dev/null || true
 
-          # Verify the file was modified
-          if [ -f "log.txt" ]; then
+          if git diff --quiet log.txt 2>/dev/null; then
+            echo "::warning::log.txt was not modified"
+            echo "result=failure" >> "$GITHUB_ENV"
+          else
             echo "=== log.txt content ==="
             cat log.txt
             echo "========================"
             echo "result=success" >> "$GITHUB_ENV"
-          else
-            echo "::warning::log.txt was not created/modified"
-            echo "result=failure" >> "$GITHUB_ENV"
           fi
 
-      # ----- Commit the result -----------------------------------------------
       - name: Commit changes
         if: env.result == 'success'
         run: |
           git config user.name "claude-interactive-bot"
           git config user.email "bot@example.com"
           git add log.txt
-          # Only commit if there are actual changes
           if git diff --cached --quiet; then
             echo "No changes to commit"
           else
@@ -214,13 +166,10 @@ jobs:
             git push
           fi
 
-      # ----- Upload debug artifacts ------------------------------------------
       - name: Upload logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: claude-session-logs
-          path: |
-            /tmp/claude-output.txt
-            logs/
+          path: /tmp/claude-output.txt
           retention-days: 7
