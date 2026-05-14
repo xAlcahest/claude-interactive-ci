@@ -51,7 +51,7 @@ jobs:
           if [ -n "$CUSTOM" ]; then
             PROMPT="$CUSTOM"
           else
-            PROMPT="Do the following tasks using your tools: 1) Run 'uname -a' and 'date' in bash to get system info. 2) Run 'ls -la' to see the repo contents. 3) Read README.md and count how many lines it has. 4) Create a file called REPORT.md with a brief report containing: the system info, the file listing, the README line count, and a timestamp. 5) Append a line to log.txt with 'Run #${RUN_NUMBER} — ${TIMESTAMP} — [tool-generated entry]'. Do all of this autonomously."
+            PROMPT="You are a helpful maintenance bot. Please: 1) Check the current date and system uptime using bash. 2) Read log.txt and count how many entries it has so far. 3) Create a file called REPORT.md containing a brief system health report with the date, uptime, and entry count. 4) Add a new entry to log.txt in the format: Run #${RUN_NUMBER} — ${TIMESTAMP} — followed by a short software engineering observation. Save all files."
           fi
 
           echo "$PROMPT" > /tmp/claude-prompt.txt
