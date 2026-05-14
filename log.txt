@@ -1,0 +1,4 @@
+# Claude Interactive Session Log
+# Each entry is added by Claude Code running in an interactive tmux session.
+# No claude -p. No Agent SDK. Just vibes and keystrokes.
+# ---

@@ -1,0 +1,222 @@
+# =============================================================================
+#  claude-interactive-cron.yml
+#
+#  PoC: Run Claude Code as an "interactive session" in GitHub Actions via tmux.
+#  Appends a timestamped entry to log.txt every 6 hours.
+#
+#  This workflow spawns Claude Code inside a real PTY (via tmux),
+#  sends input as keystrokes, and waits for completion.
+#  From Claude Code's perspective, it IS an interactive session.
+#
+#  "Distinguished engineering" at its finest.
+# =============================================================================
+
+name: Claude Interactive Cron
+
+on:
+  schedule:
+    # Every 6 hours: 00:00, 06:00, 12:00, 18:00 UTC
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
+    inputs:
+      custom_prompt:
+        description: 'Custom prompt (leave empty for default)'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+jobs:
+  interactive-claude:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      # ----- Setup -----------------------------------------------------------
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq tmux jq expect
+
+      - name: Install Claude Code
+        run: |
+          npm install -g @anthropic-ai/claude-code@latest
+          claude --version
+
+      # ----- Auth ------------------------------------------------------------
+      # Store your OAuth token as a GitHub Secret named CLAUDE_OAUTH_TOKEN
+      # To get it: run `cat ~/.claude/credentials.json` on a machine where
+      # you're logged into Claude Code with your Max subscription.
+      #
+      # IMPORTANT: This uses your SUBSCRIPTION auth, not an API key.
+      # An API key would bypass the whole point of this exercise.
+      - name: Configure Claude auth
+        env:
+          CLAUDE_OAUTH_TOKEN: ${{ secrets.CLAUDE_OAUTH_TOKEN }}
+        run: |
+          mkdir -p ~/.claude
+
+          # Write credentials file the same way Claude Code stores it
+          # The exact format depends on your auth method; adapt as needed
+          if [ -n "$CLAUDE_OAUTH_TOKEN" ]; then
+            echo "$CLAUDE_OAUTH_TOKEN" > ~/.claude/credentials.json
+            echo "Claude auth configured from secret"
+          else
+            echo "::error::CLAUDE_OAUTH_TOKEN secret not set"
+            exit 1
+          fi
+
+      # ----- Prepare the prompt ----------------------------------------------
+      - name: Build prompt
+        id: prompt
+        run: |
+          CUSTOM="${{ github.event.inputs.custom_prompt }}"
+          TIMESTAMP=$(date -u '+%Y-%m-%d %H:%M:%S UTC')
+          RUN_NUMBER="${{ github.run_number }}"
+
+          if [ -n "$CUSTOM" ]; then
+            PROMPT="$CUSTOM"
+          else
+            PROMPT="Read the file log.txt in this directory (create it if it doesn't exist). Append a new line at the end with the format: 'Run #${RUN_NUMBER} — ${TIMESTAMP} — [write a short creative observation about coding, AI, or software engineering]'. Do NOT delete existing content. Save the file. Then run 'git add log.txt && git diff --cached --stat' to verify. Reply with only what you added."
+          fi
+
+          # Save to file to avoid shell escaping hell
+          echo "$PROMPT" > /tmp/claude-prompt.txt
+          echo "prompt_file=/tmp/claude-prompt.txt" >> "$GITHUB_OUTPUT"
+
+      # ----- The main event: interactive tmux session ------------------------
+      - name: Run Claude Code interactively via tmux
+        env:
+          TERM: xterm-256color
+          # Unset any API key to force subscription auth
+          ANTHROPIC_API_KEY: ""
+        run: |
+          set +e  # Don't exit on error, we handle it ourselves
+
+          SESSION="claude-ci-$$"
+          PROMPT=$(cat "${{ steps.prompt.outputs.prompt_file }}")
+          TIMEOUT=180  # 3 minutes should be plenty for this task
+
+          echo "=== Starting tmux session: $SESSION ==="
+
+          # Create tmux session with a decent terminal size
+          tmux new-session -d -s "$SESSION" -x 200 -y 50
+
+          # Small delay for shell init
+          sleep 1
+
+          # Launch Claude Code in interactive mode (NO -p!)
+          # This is the key: without -p, it's an interactive session
+          # and uses the subscription pool, not the Agent SDK credits
+          tmux send-keys -t "$SESSION" "cd $GITHUB_WORKSPACE && claude --verbose" Enter
+
+          # Wait for Claude Code to initialize
+          echo "Waiting for Claude Code to start..."
+          INIT_WAIT=0
+          while [ $INIT_WAIT -lt 45 ]; do
+            BUFFER=$(tmux capture-pane -t "$SESSION" -p 2>/dev/null || true)
+            if echo "$BUFFER" | grep -qiE '(>|❯|claude|prompt|Enter a prompt|waiting)'; then
+              echo "Claude Code is ready (after ${INIT_WAIT}s)"
+              break
+            fi
+            sleep 1
+            INIT_WAIT=$((INIT_WAIT + 1))
+          done
+
+          if [ $INIT_WAIT -ge 45 ]; then
+            echo "::warning::Claude Code took too long to initialize"
+            tmux capture-pane -t "$SESSION" -p
+            tmux kill-session -t "$SESSION" 2>/dev/null || true
+            exit 1
+          fi
+
+          # Send the prompt as keystrokes (exactly like a human typing)
+          echo "Sending prompt..."
+          # Use bracket paste for the full prompt
+          tmux send-keys -t "$SESSION" -l "$(printf '\033[200~')${PROMPT}$(printf '\033[201~')"
+          sleep 0.5
+          tmux send-keys -t "$SESSION" Enter
+
+          # Wait for Claude to finish
+          echo "Waiting for Claude Code to complete..."
+          ELAPSED=0
+          LAST_HASH=""
+          STABLE=0
+
+          while [ $ELAPSED -lt $TIMEOUT ]; do
+            sleep 3
+            ELAPSED=$((ELAPSED + 3))
+
+            BUFFER=$(tmux capture-pane -t "$SESSION" -p 2>/dev/null || true)
+            CURRENT_HASH=$(echo "$BUFFER" | md5sum | cut -d' ' -f1)
+
+            # Check if output has stabilized (same hash = Claude stopped producing)
+            if [ "$CURRENT_HASH" = "$LAST_HASH" ]; then
+              STABLE=$((STABLE + 1))
+              if [ $STABLE -ge 3 ]; then
+                echo "Output stable for 9s — Claude Code appears done"
+                break
+              fi
+            else
+              STABLE=0
+            fi
+            LAST_HASH="$CURRENT_HASH"
+
+            # Progress indicator
+            if [ $((ELAPSED % 15)) -eq 0 ]; then
+              echo "  ... still working (${ELAPSED}s)"
+            fi
+          done
+
+          # Capture final output
+          echo "=== Final tmux buffer ==="
+          tmux capture-pane -t "$SESSION" -p -S -200 | tee /tmp/claude-output.txt
+          echo "========================="
+
+          # Send /exit to Claude Code gracefully
+          tmux send-keys -t "$SESSION" "/exit" Enter
+          sleep 2
+
+          # Kill tmux session
+          tmux kill-session -t "$SESSION" 2>/dev/null || true
+
+          # Verify the file was modified
+          if [ -f "log.txt" ]; then
+            echo "=== log.txt content ==="
+            cat log.txt
+            echo "========================"
+            echo "result=success" >> "$GITHUB_ENV"
+          else
+            echo "::warning::log.txt was not created/modified"
+            echo "result=failure" >> "$GITHUB_ENV"
+          fi
+
+      # ----- Commit the result -----------------------------------------------
+      - name: Commit changes
+        if: env.result == 'success'
+        run: |
+          git config user.name "claude-interactive-bot"
+          git config user.email "bot@example.com"
+          git add log.txt
+          # Only commit if there are actual changes
+          if git diff --cached --quiet; then
+            echo "No changes to commit"
+          else
+            git commit -m "log: entry added by interactive Claude session (run #${{ github.run_number }})"
+            git push
+          fi
+
+      # ----- Upload debug artifacts ------------------------------------------
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: claude-session-logs
+          path: |
+            /tmp/claude-output.txt
+            logs/
+          retention-days: 7
