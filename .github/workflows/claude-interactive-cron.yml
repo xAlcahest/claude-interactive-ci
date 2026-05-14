@@ -62,6 +62,19 @@ jobs:
           fi
           echo "Claude auth token present (${#CLAUDE_CODE_OAUTH_TOKEN} chars)"
 
+      # ----- Debug: test auth works at all ------------------------------------
+      - name: Debug — test Claude auth with -p
+        env:
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_OAUTH_TOKEN }}
+          ANTHROPIC_API_KEY: ""
+        run: |
+          echo "Testing if Claude Code recognizes the token..."
+          # Quick test with -p (yes this uses Agent SDK pool, but it's just a test)
+          timeout 30 claude -p "Reply with exactly: AUTH_OK" --output-format text 2>&1 || true
+          echo "---"
+          echo "Auth status:"
+          claude auth status 2>&1 || true
+
       # ----- Prepare the prompt ----------------------------------------------
       - name: Build prompt
         id: prompt
