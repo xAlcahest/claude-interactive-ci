@@ -111,9 +111,8 @@ jobs:
           # Write a credentials file using the setup-token as accessToken
           # The TUI reads from .credentials.json, not the env var
           mkdir -p ~/.claude
-          cat > ~/.claude/.credentials.json << CREDS_EOF
-{"claudeAiOauth":{"accessToken":"${CLAUDE_CODE_OAUTH_TOKEN}","refreshToken":"${CLAUDE_CODE_OAUTH_TOKEN}","expiresAt":9999999999999,"scopes":["user:file_upload","user:inference","user:mcp_servers","user:profile","user:sessions:claude_code"],"subscriptionType":"max","rateLimitTier":"default_claude_max_20x"}}
-CREDS_EOF
+          printf '{"claudeAiOauth":{"accessToken":"%s","refreshToken":"%s","expiresAt":9999999999999,"scopes":["user:file_upload","user:inference","user:mcp_servers","user:profile","user:sessions:claude_code"],"subscriptionType":"max","rateLimitTier":"default_claude_max_20x"}}' \
+            "$CLAUDE_CODE_OAUTH_TOKEN" "$CLAUDE_CODE_OAUTH_TOKEN" > ~/.claude/.credentials.json
 
           echo "Wrote .credentials.json with setup token"
 
