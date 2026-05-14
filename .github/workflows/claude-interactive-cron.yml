@@ -95,14 +95,22 @@ jobs:
 
           echo "=== Starting tmux session: $SESSION ==="
 
+          # Write the auth token to a temp file — avoids send-keys quoting hell
+          echo "export CLAUDE_CODE_OAUTH_TOKEN='${CLAUDE_CODE_OAUTH_TOKEN}'" > /tmp/.claude-env
+          chmod 600 /tmp/.claude-env
+
           # Create tmux session with a decent terminal size
           tmux new-session -d -s "$SESSION" -x 200 -y 50
 
           sleep 1
 
-          # Pass the auth token into the tmux session's environment
-          tmux send-keys -t "$SESSION" "export CLAUDE_CODE_OAUTH_TOKEN='$CLAUDE_CODE_OAUTH_TOKEN'" Enter
+          # Source the env file inside the tmux session (bulletproof, no quoting issues)
+          tmux send-keys -t "$SESSION" "source /tmp/.claude-env" Enter
           sleep 0.5
+
+          # Verify the env var is set inside tmux
+          tmux send-keys -t "$SESSION" 'echo "OAUTH_SET=${#CLAUDE_CODE_OAUTH_TOKEN} chars"' Enter
+          sleep 1
 
           # Launch Claude Code in interactive mode (NO -p!)
           tmux send-keys -t "$SESSION" "cd $GITHUB_WORKSPACE && claude --verbose" Enter
