@@ -120,25 +120,44 @@ jobs:
           tmux new-session -d -s "$SESSION" -x 200 -y 50 \
             "cd $GITHUB_WORKSPACE && export CLAUDE_CODE_OAUTH_TOKEN='${CLAUDE_CODE_OAUTH_TOKEN}' && claude --verbose; bash"
 
-          # Wait for Claude Code to ACTUALLY initialize (not just our command echo)
-          # We wait a minimum of 5s before even checking, then look for
-          # the actual TUI prompt, not our shell command
+          # Wait for Claude Code to ACTUALLY initialize
           echo "Waiting for Claude Code to start..."
           sleep 5
           INIT_WAIT=5
           while [ $INIT_WAIT -lt 60 ]; do
             BUFFER=$(tmux capture-pane -t "$SESSION" -p 2>/dev/null || true)
-            # Look for Claude Code's actual prompt indicators, NOT our command
-            if echo "$BUFFER" | grep -qE '(Enter a prompt|tips:|❯|>\s*$)'; then
+
+            # If login screen appeared, navigate it automatically
+            if echo "$BUFFER" | grep -q "Select login method"; then
+              echo "Login screen detected — selecting option 1 (subscription)..."
+              sleep 1
+              tmux send-keys -t "$SESSION" "1" Enter
+              sleep 5
+              # Check what happened after selecting
+              BUFFER2=$(tmux capture-pane -t "$SESSION" -p 2>/dev/null || true)
+              echo "Post-login buffer:"
+              echo "$BUFFER2" | tail -15
+              # If we see a prompt, we're in
+              if echo "$BUFFER2" | grep -qE '(Enter a prompt|tips:|❯)'; then
+                echo "Claude Code authenticated and ready!"
+                break
+              fi
+              # If it asks for browser/URL, we have a problem
+              if echo "$BUFFER2" | grep -qiE '(browser|http|url|code:)'; then
+                echo "::error::Claude Code wants browser-based OAuth — cannot do in CI"
+                tmux capture-pane -t "$SESSION" -p
+                tmux kill-session -t "$SESSION" 2>/dev/null || true
+                exit 1
+              fi
+              sleep 3
+              INIT_WAIT=$((INIT_WAIT + 9))
+              continue
+            fi
+
+            # Already past login — look for Claude's prompt
+            if echo "$BUFFER" | grep -qE '(Enter a prompt|tips:|❯)'; then
               echo "Claude Code is ready (after ${INIT_WAIT}s)"
               break
-            fi
-            # Also detect if login screen appeared (auth failed)
-            if echo "$BUFFER" | grep -q "Select login method"; then
-              echo "::error::Claude Code is asking for login — auth token not working"
-              tmux capture-pane -t "$SESSION" -p
-              tmux kill-session -t "$SESSION" 2>/dev/null || true
-              exit 1
             fi
             sleep 2
             INIT_WAIT=$((INIT_WAIT + 2))
