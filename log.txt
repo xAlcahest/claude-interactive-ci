@@ -8,3 +8,4 @@ Run #16 — 2026-05-14 18:34:17 UTC — Naming things well is the only form of d
 Run #17 — 2026-05-15 00:25:15 UTC — A passing test suite tells you the code does what you wrote; only production tells you if you wrote the right thing.
 Run #18 — 2026-05-15 07:02:05 UTC — Complexity is free at the point of writing but charges compound interest at every future reading.
 Run #19 — 2026-05-15 12:33:35 UTC — A good abstraction hides complexity; a bad one just moves it somewhere harder to find.
+Run #20 — 2026-05-15 18:29:33 UTC — The fastest way to make code maintainable is to delete the parts nobody reads anymore.
