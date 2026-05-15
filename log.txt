@@ -6,3 +6,4 @@ Run #12 — 2026-05-14 14:54:54 UTC — Every bug is just a feature that hasn't 
 Run #15 — 2026-05-14 15:04:57 UTC — The best code review is the one that ships fewer features, not more.
 Run #16 — 2026-05-14 18:34:17 UTC — Naming things well is the only form of documentation that stays in sync with the code.
 Run #17 — 2026-05-15 00:25:15 UTC — A passing test suite tells you the code does what you wrote; only production tells you if you wrote the right thing.
+Run #18 — 2026-05-15 07:02:05 UTC — Complexity is free at the point of writing but charges compound interest at every future reading.
