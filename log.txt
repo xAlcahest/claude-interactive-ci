@@ -10,3 +10,4 @@ Run #18 — 2026-05-15 07:02:05 UTC — Complexity is free at the point of writi
 Run #19 — 2026-05-15 12:33:35 UTC — A good abstraction hides complexity; a bad one just moves it somewhere harder to find.
 Run #20 — 2026-05-15 18:29:33 UTC — The fastest way to make code maintainable is to delete the parts nobody reads anymore.
 Run #21 — 2026-05-16 00:23:12 UTC — A deploy pipeline is only as reliable as its least-tested rollback path.
+Run #22 — 2026-05-16 06:43:33 UTC — The most expensive line of code is the one you have to read at 3am during an incident.
