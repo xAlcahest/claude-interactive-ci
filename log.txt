@@ -16,3 +16,4 @@ Run #24 — 2026-05-16 18:16:40 UTC — The interface you design today becomes t
 Run #25 — 2026-05-17 00:24:38 UTC — Observability is not a feature you add after the fact; it's the evidence you wish you had planted before the incident.
 Run #26 — 2026-05-17 06:54:05 UTC — Every dependency you add is a vote for someone else's release schedule governing yours.
 Run #27 — 2026-05-17 12:16:07 UTC — A well-defined interface boundary is worth a thousand integration tests; it shrinks the surface where surprises can hide.
+Run #28 — 2026-05-17 18:19:00 UTC — The gap between "it works on my machine" and "it works in production" is exactly the size of the environment assumptions you forgot to write down.
