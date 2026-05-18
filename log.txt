@@ -18,3 +18,4 @@ Run #26 — 2026-05-17 06:54:05 UTC — Every dependency you add is a vote for s
 Run #27 — 2026-05-17 12:16:07 UTC — A well-defined interface boundary is worth a thousand integration tests; it shrinks the surface where surprises can hide.
 Run #28 — 2026-05-17 18:19:00 UTC — The gap between "it works on my machine" and "it works in production" is exactly the size of the environment assumptions you forgot to write down.
 Run #29 — 2026-05-18 00:25:49 UTC — A good commit message is a gift to the future engineer who has to understand why, not just what, a change was made.
+Run #30 — 2026-05-18 07:16:43 UTC — The cost of skipping a code review scales exponentially with the size of the system it touches; the minutes saved now become hours of archaeology later.
