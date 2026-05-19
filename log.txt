@@ -21,3 +21,4 @@ Run #29 — 2026-05-18 00:25:49 UTC — A good commit message is a gift to the f
 Run #30 — 2026-05-18 07:16:43 UTC — The cost of skipping a code review scales exponentially with the size of the system it touches; the minutes saved now become hours of archaeology later.
 Run #31 — 2026-05-18 13:06:19 UTC — A well-placed assertion is worth more than a comment; it documents intent and enforces it at the same time.
 Run #32 — 2026-05-18 18:33:04 UTC — Dependency graphs are architecture made visible; when they become a tangle, the coupling problem already existed in your design.
+Run #33 — 2026-05-19 00:28:26 UTC — The best time to add a feature flag is before the deploy; the second best time is after the incident that taught you why you needed one.
