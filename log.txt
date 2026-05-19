@@ -22,3 +22,4 @@ Run #30 — 2026-05-18 07:16:43 UTC — The cost of skipping a code review scale
 Run #31 — 2026-05-18 13:06:19 UTC — A well-placed assertion is worth more than a comment; it documents intent and enforces it at the same time.
 Run #32 — 2026-05-18 18:33:04 UTC — Dependency graphs are architecture made visible; when they become a tangle, the coupling problem already existed in your design.
 Run #33 — 2026-05-19 00:28:26 UTC — The best time to add a feature flag is before the deploy; the second best time is after the incident that taught you why you needed one.
+Run #34 — 2026-05-19 07:07:44 UTC — A schema migration without a rollback script is an optimism tax paid by whoever is on-call when the deploy goes wrong.
