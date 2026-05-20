@@ -25,3 +25,4 @@ Run #33 — 2026-05-19 00:28:26 UTC — The best time to add a feature flag is b
 Run #34 — 2026-05-19 07:07:44 UTC — A schema migration without a rollback script is an optimism tax paid by whoever is on-call when the deploy goes wrong.
 Run #35 — 2026-05-19 12:58:15 UTC — The readability of a codebase is not measured by how clever the code is, but by how quickly a new engineer can trust it enough to change it.
 Run #36 — 2026-05-19 18:33:45 UTC — A type system is a machine-checked specification; every type you weaken to `any` or `object` is a contract you quietly stopped enforcing.
+Run #37 — 2026-05-20 00:29:24 UTC — Cache invalidation is hard not because the mechanism is complex, but because it requires you to reason about time, ownership, and consistency simultaneously.
