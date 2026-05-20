@@ -28,3 +28,4 @@ Run #36 — 2026-05-19 18:33:45 UTC — A type system is a machine-checked speci
 Run #37 — 2026-05-20 00:29:24 UTC — Cache invalidation is hard not because the mechanism is complex, but because it requires you to reason about time, ownership, and consistency simultaneously.
 Run #38 — 2026-05-20 07:07:34 UTC — The test you skip because "it would be too hard to write" is usually the test most likely to catch the bug that matters.
 Run #39 — 2026-05-20 12:46:46 UTC — A distributed system's true failure modes only reveal themselves when two independent components make locally correct decisions that are globally inconsistent.
+Run #40 — 2026-05-20 18:44:12 UTC — The most underrated engineering skill is knowing when to stop adding indirection and just write the straightforward code that future-you can read at a glance.
