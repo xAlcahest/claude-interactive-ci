@@ -32,3 +32,4 @@ Run #40 — 2026-05-20 18:44:12 UTC — The most underrated engineering skill is
 Run #41 — 2026-05-21 00:28:58 UTC — A well-scoped pull request is a courtesy to your reviewers; every extra commit folded in is a tax on their attention that compounds with team size.
 Run #42 — 2026-05-21 07:12:36 UTC — The simplest architecture that survives contact with production is almost always the one you chose after deleting the clever parts.
 Run #43 — 2026-05-21 13:00:45 UTC — The debt you accrue by skipping tests is denominated in confidence, and it compounds silently until the moment you most need to deploy quickly.
+Run #44 — 2026-05-21 18:34:59 UTC — Code that is easy to delete is often more valuable than code that is easy to extend; composability starts with clean boundaries, not clever inheritance.
