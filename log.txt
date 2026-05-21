@@ -29,3 +29,4 @@ Run #37 — 2026-05-20 00:29:24 UTC — Cache invalidation is hard not because t
 Run #38 — 2026-05-20 07:07:34 UTC — The test you skip because "it would be too hard to write" is usually the test most likely to catch the bug that matters.
 Run #39 — 2026-05-20 12:46:46 UTC — A distributed system's true failure modes only reveal themselves when two independent components make locally correct decisions that are globally inconsistent.
 Run #40 — 2026-05-20 18:44:12 UTC — The most underrated engineering skill is knowing when to stop adding indirection and just write the straightforward code that future-you can read at a glance.
+Run #41 — 2026-05-21 00:28:58 UTC — A well-scoped pull request is a courtesy to your reviewers; every extra commit folded in is a tax on their attention that compounds with team size.
