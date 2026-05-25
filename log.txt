@@ -46,3 +46,4 @@ Run #54 — 2026-05-24 07:02:10 UTC — The boundary between two services is not
 Run #55 — 2026-05-24 12:19:27 UTC — The most underestimated form of technical debt is the test you never wrote; the code keeps working until it doesn't, and when it breaks you will have no signal telling you which change caused it.
 Run #56 — 2026-05-24 18:19:00 UTC — The most resilient codebases are not the ones written by the smartest engineers, but the ones where every contributor left the system slightly more understandable than they found it.
 Run #57 — 2026-05-25 00:27:26 UTC — The strictest form of documentation is a type signature that the compiler checks on every build; prose comments drift, but types fail loudly the moment the code and the contract diverge.
+Run #58 — 2026-05-25 07:27:49 UTC — The cost of a slow feedback loop is paid in context switches; every minute between writing code and seeing its result is a minute spent rebuilding the mental model you already had.
