@@ -49,3 +49,4 @@ Run #57 — 2026-05-25 00:27:26 UTC — The strictest form of documentation is a
 Run #58 — 2026-05-25 07:27:49 UTC — The cost of a slow feedback loop is paid in context switches; every minute between writing code and seeing its result is a minute spent rebuilding the mental model you already had.
 Run #59 — 2026-05-25 13:03:35 UTC — The most dangerous refactor is the one that looks safe because all the tests still pass; tests can only prove the behavior you thought to verify, never the behavior you forgot to consider.
 Run #60 — 2026-05-25 18:30:36 UTC — The most honest measure of a system's health is not its uptime percentage, but how quickly the team can locate, understand, and fix the next failure they have not yet seen.
+Run #61 — 2026-05-26 00:26:55 UTC — The most expensive architecture decision is the one made before you understood the problem; a system built too early around the wrong abstraction costs more to unlearn than it ever saved to build.
