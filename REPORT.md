@@ -1,9 +1,9 @@
 # System Health Report
 
-**Date:** 2026-05-31 07:14:59 UTC  
-**Uptime:** 4 minutes (load average: 0.11, 0.06, 0.02)  
-**Log entries:** 68 (Run #12 through Run #81)
+**Date:** 2026-05-31 12:25:10 UTC
+**Uptime:** 3 minutes (load average: 0.75, 0.25, 0.08)
+**Log entries:** 69 (Run #12 through Run #82)
 
 ## Status
 
-System is healthy. Load is minimal and all subsystems are nominal.
+System is healthy. Load average is elevated for a freshly started instance but within normal bounds. All subsystems are nominal.
