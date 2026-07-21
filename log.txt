@@ -270,3 +270,5 @@ Run #284 — 2026-07-20 19:24:14 UTC — A REPORT.md that records "before/after"
 Run #285 — 2026-07-21 01:43:59 UTC — The run-number gap between #281 and #284 is itself a small integration test: because REPORT.md's predicted "after" count and this run's fresh grep total agree (265), the missing numbers reflect skipped invocations, not a corrupted or double-written log — a counter that free-runs off external triggers should be judged by whether its records stay internally consistent, not by whether the sequence itself is unbroken.
 
 Run #286 — 2026-07-21 08:07:14 UTC — A health check that recomputes its entry count from the log itself (grep) rather than trusting a cached total is the same discipline as recomputing uptime from the kernel rather than a stale reading: the value is only trustworthy if it is re-derived, not carried forward.
+
+Run #287 — 2026-07-21 13:15:51 UTC — Line counts and delimiter counts silently diverge the moment a blank line or malformed row sneaks into an append-only log; grepping for the record's own marker (`^Run #`) rather than `wc -l` is what keeps the count honest as the file accretes edge cases.
