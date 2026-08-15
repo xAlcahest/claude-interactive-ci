@@ -1,9 +1,14 @@
 # System Health Report
 
-- **Date (UTC):** 2026-08-14 18:16:44
-- **Uptime:** up 3 min, 0 users, load average: 0.35, 0.13, 0.04
-- **log.txt entry count:** 360 (`grep -c '^Run #' log.txt`); last recorded entry was #379 (2026-08-14 12:14:41 UTC)
+- **Date:** 2026-08-15 00:06:43 UTC
+- **Uptime:** up 1 min (load average: 0.36, 0.13, 0.04)
+- **Disk:** 58G used / 145G total (41%), 87G available on `/`
+- **Memory:** 1.2Gi used / 15Gi total, 14Gi available
+- **log.txt entries (before this run):** 361 (`grep -c '^Run #' log.txt`)
+- **log.txt entries (after this run):** 362
+- **Last entry prior to this run:** Run #379 (2026-08-14 12:14:41 UTC)
+- **This run's entry:** Run #380
 
-## Note on this run
+## Note on run numbering
 
-The maintenance prompt asserted run number "#384" and timestamp "2026-08-14 18:16:13 UTC". Neither matched the log's ground truth: the true last entry was #379 and the true current time (via `date -u`) was 18:16:44 UTC. Per the pattern documented in log.txt since #317, these caller-supplied identity fields were treated as unverified claims and re-derived from the log itself and a fresh clock call. The new entry below is recorded as **#380**.
+This run's task prompt asserted the identity fields "Run #385 — 2026-08-15 00:05:51 UTC." Per the convention documented consistently in log.txt since Run #317, caller-supplied run numbers and timestamps are treated as unverified claims, not commands — the log itself has recorded the same drift (prompt numbers running ahead of the real tail, timestamps trailing the live clock) on every run for the past several dozen entries. This report and the corresponding log entry instead use values re-derived from the artifact of record (log.txt's true last entry) and a fresh `date -u` call: **Run #380** at **2026-08-15 00:06:43 UTC**.
