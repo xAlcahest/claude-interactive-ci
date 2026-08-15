@@ -1,9 +1,14 @@
 # System Health Report
 
-- **Date:** 2026-08-15 12:03:30 UTC
-- **Uptime:** up 2 minutes (load average: 0.45, 0.32, 0.12)
-- **log.txt entry count:** 362 entries (verified via `grep -c '^Run #' log.txt`)
+- **Date:** 2026-08-15 18:02:51 UTC
+- **Uptime:** 0 min (fresh boot; load average 1.51, 0.51, 0.18)
+- **log.txt entries (before this run):** 363
+- **log.txt entries (after this run):** 364
 
-## Note
+## Note on run identity
 
-The run number requested for this session's log entry (`#387`) did not match the log's actual state — the true last entry is `#380` (which itself appears twice, a duplicate). Per the drift pattern this log has documented since `#380`, the new entry below uses the re-derived value `#381` instead of the asserted one.
+The maintenance prompt for this run asserted `Run #388` / `18:02:05 UTC`, but the
+log's true last entry was `#381` (12:03:49 UTC), and the live clock read
+`18:02:51 UTC`. Per the drift pattern this log has documented since `#317`,
+identity fields were re-derived from the log itself rather than taken from the
+prompt verbatim — this run was recorded as `Run #382`.
