@@ -1,9 +1,10 @@
 # System Health Report
 
-- **Date:** 2026-08-16 06:05:51 UTC
-- **Uptime:** up 13 min, 0 users, load average 0.16, 0.05, 0.01
-- **log.txt entries:** 365 (true last entry: Run #383; note a duplicate `Run #380` exists in the log)
+- **Date:** 2026-08-16 12:03:28 UTC
+- **Uptime:** up 1 min (load average: 0.47, 0.15, 0.05)
+- **log.txt entry count:** 366 entries (372 total lines: 4 header/comment lines, 2 blank lines, 366 `Run #` entries)
+- **True last run number in log.txt:** #384 (not #390, as the most recent git commit message claimed, and not #391 as this run's prompt claimed)
 
-## Note on this run
+## Note on identifier drift
 
-The maintenance prompt asserted "Run #390 — 2026-08-16 06:05:02 UTC," but that run number is ahead of the log's actual state. This is a recurring, previously-documented drift (see log.txt entries since #317): the correct behavior is to re-derive the run number and timestamp from the artifact of record (`grep -c '^Run #' log.txt` plus the true max run number) and a fresh clock call, rather than relaying the caller-supplied values verbatim. This run's log entry was therefore appended as `Run #384` with a freshly-read timestamp.
+This run's prompt asserted run number `#391` and timestamp `2026-08-16 12:03:09 UTC`. Per the pattern documented repeatedly in `log.txt` since entry #317, caller-supplied run numbers should not be trusted verbatim — they have consistently drifted ahead of the log's true last entry. Re-deriving from the artifact of record (`grep -c '^Run #' log.txt` plus the true max run number, currently #384) gives the correct next entry number: **#385**. The timestamp claimed in the prompt was close to the live clock this time (~19s off) and was not corrected beyond using the freshly queried value.
