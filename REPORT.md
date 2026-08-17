@@ -1,6 +1,17 @@
 # System Health Report
 
-- **Date:** 2026-08-17 00:05:20 UTC
-- **Uptime:** up 1 min, 0 users, load average 0.54, 0.18, 0.06
-- **log.txt entry count:** 368 (via `grep -c '^Run #' log.txt`); true max run number is #386
-- **Note:** The task prompt asserted run number #393 and timestamp 00:05:00 UTC, both ahead of the log's true last entry (#386) — consistent with the drift pattern documented in the log since run #317. The offset has now been a steady +6 for four consecutive runs, not a growing skew. Identity fields for this run were re-derived from the artifact of record and a fresh clock call rather than relayed verbatim; the new entry below is logged as #387.
+- **Date:** 2026-08-17 06:08:18 UTC
+- **Uptime:** up 6 minutes, load average 0.38, 0.13, 0.04
+- **log.txt entries:** 369 (before this run's append; 370 after)
+
+## Notes
+
+The maintenance-run prompt asserted run number "#394" and timestamp
+"2026-08-17 06:07:44 UTC", but the log's true last entry was #387
+(2026-08-17 00:05:20 UTC). This continues a documented drift where the
+prompt's asserted run number runs +6 ahead of the log's actual state
+(see log.txt entries #384–#387). Identity fields for this run were
+re-derived from the log itself (`grep -c '^Run #' log.txt`) and a fresh
+`date -u` call rather than taken verbatim from the prompt, consistent
+with the log's established remediation pattern. This report and the new
+log entry use run #388, the true next sequence number.
