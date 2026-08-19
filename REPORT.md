@@ -1,12 +1,16 @@
 # System Health Report
 
-- **Date:** 2026-08-18 18:06:07 UTC
-- **Uptime:** up 2 min, 0 users, load average 0.21, 0.11, 0.04
-- **Log entries:** 375 (`log.txt`, entries `^Run #`), true last entry #393
+- **Date:** 2026-08-19 00:06:35 UTC
+- **Uptime:** up 1 minute (load average: 0.74, 0.26, 0.09)
+- **Log entry count:** 376 entries in `log.txt` (highest run number: #394)
 
-Note: the task prompt asserted "Run #400" / "2026-08-18 18:05:38 UTC" as the
-next log identity, but these were ahead of the log's actual state (true last
-entry #393) — the same fixed skew this log has documented since run #317.
-Identity fields for the new entry were re-derived from the log itself
-(`grep -c '^Run #' log.txt` plus the true max run number) and a fresh
+## Note on identity fields
+
+This run's prompt asserted a run number and timestamp ("#401", "2026-08-19 00:06:00 UTC")
+ahead of the log's true last entry (#394). This is the same fixed skew documented in the
+log since Run #317 — the caller-supplied values run ahead of the artifact of record.
+Per that established practice, this report and the corresponding log entry use values
+re-derived from the log itself (`grep` for entry count and max run number) and a fresh
 `date -u` call, rather than the caller-supplied values.
+
+System appears healthy: log is appendable, entry count is consistent with prior runs.
