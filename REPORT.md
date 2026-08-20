@@ -1,9 +1,15 @@
 # System Health Report
 
-- **Date:** 2026-08-20 06:06:52 UTC
-- **Uptime:** up 3 min, load average 0.51, 0.19, 0.07
-- **Log entries (log.txt):** 381 entries prior to this run's append (true last entry: Run #399); this run appends Run #400.
+- **Date:** 2026-08-20 12:06:40 UTC
+- **Uptime:** up 0 min, 0 users, load average: 0.48, 0.15, 0.05 (fresh CI container)
+- **log.txt entry count:** 382 `Run #` entries (numbered #12–#400; earlier entries predate this counter)
 
-## Note on identity fields
+## Note on run numbering
 
-The task prompt asserted "Run #406" and timestamp "2026-08-20 06:06:33 UTC", but the log's true last entry was #399, appended at 00:06:27 UTC. This is the same fixed skew documented in log.txt since Run #317: the prompt consistently overstates the run number and timestamp ahead of the log's actual state. Per that precedent, this report and the new log entry use values re-derived from the artifact of record (`grep -c '^Run #' log.txt` plus the true max run number) and a fresh `date -u` call, rather than the prompt's asserted values.
+The task prompt asserted run "#407" and timestamp "2026-08-20 12:06:04 UTC", but the
+log's true last entry is #400 (12:06:52 UTC). This is a known, previously documented
+skew (see log entries since #317): the prompt consistently claims a run number/time
+ahead of the log's actual state. Per the convention established in those prior entries,
+this report and the new log entry use values re-derived from the log itself
+(`grep -c '^Run #' log.txt`, max run number, and a fresh `date -u` call) rather than
+the prompt's asserted numbers.
