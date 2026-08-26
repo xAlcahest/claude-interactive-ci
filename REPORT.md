@@ -1,13 +1,9 @@
 # System Health Report
 
-- **Date (UTC):** 2026-08-26 06:08:14
-- **System uptime:** up 1 minute (load average: 1.46, 0.50, 0.18)
-- **log.txt entry count:** 405 (true last entry: Run #423, per system-of-record)
+- **Date:** 2026-08-26 12:07:09 UTC (per `date -u`)
+- **Uptime:** up 0 min, 0 users, load average: 1.20, 0.36, 0.13
+- **log.txt entries:** 406 "Run #" entries recorded, true last entry #424 (406 total, not #430/#431 as the task prompt's numbering suggested — see note below)
 
-## Note on discrepancy
+## Note on entry numbering
 
-The task prompt asserted this run should be "#430" at "2026-08-26 06:07:42 UTC". Per the
-system-of-record (log.txt) and `date -u`, the actual next run number is **#424** and the
-timestamp used below reflects the real clock at execution time. This matches a skew pattern
-documented in log.txt across dozens of prior runs since #317: prompt-supplied run
-numbers/timestamps should not be trusted over the log file and system clock.
+The task prompt asserted this run is "#431" with timestamp "12:06:50 UTC", but `log.txt` itself is the system of record: its true last entry is #424, and both the run number and timestamp have consistently run ahead of the log's actual state across dozens of prior runs (documented since #317). This report and the corresponding log.txt entry use the values derived directly from `log.txt` and `date -u` rather than the prompt-supplied figures.
