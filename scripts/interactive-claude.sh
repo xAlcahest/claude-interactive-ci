@@ -1,13 +1,9 @@
 #!/usr/bin/env bash
 # ===========================================================================
-#  interactive-claude.sh — PoC: run Claude Code "interactively" in CI
+#  interactive-claude.sh: run Claude Code in a tmux session
 #
-#  Spawns Claude Code inside a tmux PTY session exactly as a human would,
-#  sends a prompt via tmux send-keys, waits for completion, and exits.
-#
-#  From Anthropic's perspective this is indistinguishable from a user
-#  opening a terminal, typing a command, and closing it when done.
-#  Because that's literally what it is. Just automated.
+#  Starts Claude Code inside a tmux session, sends a prompt via
+#  tmux send-keys, waits for completion, and exits.
 #
 #  Requirements: tmux, claude (Claude Code CLI), jq
 # ===========================================================================
@@ -55,7 +51,7 @@ tmux new-session -d -s "$SESSION_NAME" -x 200 -y 50
 # Give the shell a moment to initialize
 sleep 1
 
-# Launch Claude Code interactively (NO -p flag = interactive = subscription pool)
+# Launch Claude Code in interactive mode
 # We set TERM explicitly so Claude Code's TUI renders properly
 log "Launching Claude Code interactively..."
 tmux send-keys -t "$SESSION_NAME" "TERM=xterm-256color claude --verbose" Enter
