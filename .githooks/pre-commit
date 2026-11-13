@@ -91,7 +91,7 @@ if [ "$fake_changed" = 1 ] && command -v python3 >/dev/null 2>&1; then
   python3 -I -c 'import ast, sys; ast.parse(open(sys.argv[1]).read(), sys.argv[1])' tests/fake-claude ||
     fail "syntax error in tests/fake-claude"
 fi
-[ -z "$shell_files" ] && [ "$fake_changed" = 0 ] || say "syntax ok"
+if [ -n "$shell_files" ] || [ "$fake_changed" = 1 ]; then say "syntax ok"; fi
 
 # 3. shellcheck
 if [ -n "$shell_files" ]; then

@@ -127,7 +127,7 @@ tmux_socket() {
 
 expect_no_tmux() {
   local sock
-  sock=$(tmux_socket "${1:-$OUT}")
+  sock=$(tmux_socket "$OUT")
   [ -n "$sock" ] || fail "no tmux socket name in driver.log"
   if env -u TMUX tmux -L "$sock" has-session 2>/dev/null; then
     fail "tmux server $sock is still running"

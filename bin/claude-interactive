@@ -322,7 +322,9 @@ parse_run_args() {
   COLS=$((10#$COLS))
   ROWS=$((10#$ROWS))
   [ "$TIMEOUT" -gt 0 ] || die_usage "--timeout must be greater than 0" run
-  [ "$COLS" -ge 80 ] && [ "$ROWS" -ge 20 ] || die_usage "terminal must be at least 80x20" run
+  if [ "$COLS" -lt 80 ] || [ "$ROWS" -lt 20 ]; then
+    die_usage "terminal must be at least 80x20" run
+  fi
   case $PERMISSION_MODE in
     bypassPermissions | acceptEdits | auto | dontAsk | manual | plan | default) ;;
     *) die_usage "unknown permission mode: $PERMISSION_MODE" run ;;
@@ -1056,7 +1058,7 @@ finalize() {
     --argjson duration "$((SECONDS - RUN_T0))" \
     --arg claude_exit "${CLAUDE_EXIT_STATUS:-}" \
     --arg session_end "$SESSION_END_REASON" \
-    --arg transcript "$([ -f "$OUT_DIR/transcript.jsonl" ] && echo transcript.jsonl || true)" \
+    --arg transcript "$(if [ -f "$OUT_DIR/transcript.jsonl" ]; then echo transcript.jsonl; fi)" \
     --argjson usage "$usage" \
     --slurpfile turns "$INTERNAL_DIR/turns.jsonl" \
     --rawfile final "$OUT_DIR/final-message.txt" \
