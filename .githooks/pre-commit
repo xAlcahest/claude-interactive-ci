@@ -1,0 +1,134 @@
+#!/usr/bin/env bash
+#
+# pre-commit: check exactly what is about to be committed.
+#
+# The staged snapshot, not the working tree, is exported to a temporary
+# directory and checked there. Unstaged edits cannot make a broken commit
+# look fine.
+#
+# Checks, in order:
+#   1. forgotten files: untracked files under bin/ or tests/, when the
+#      commit is going to run the test suite
+#   2. syntax of the staged shell scripts and of tests/fake-claude
+#   3. shellcheck on the staged shell scripts, when shellcheck is installed
+#   4. YAML parse of the staged action.yml and workflows, when ruby exists
+#   5. the offline test suite (tests/run.sh), when the commit touches bin/,
+#      scripts/, tests/, .githooks/ or action.yml
+#
+# Steps 2 to 4 look only at files changed by the commit, so an unrelated
+# commit is never blocked by an older file; CI checks everything.
+#
+# Enable with scripts/install-hooks.sh. Skip once with `git commit --no-verify`.
+# CLAUDE_INTERACTIVE_PRECOMMIT_TESTS=always|never overrides step 5.
+
+set -euo pipefail
+
+say() { printf 'pre-commit: %s\n' "$*" >&2; }
+fail() {
+  say "FAILED: $*"
+  say "commit aborted. Fix it, or skip the checks once with: git commit --no-verify"
+  exit 1
+}
+
+# Both commands honor GIT_INDEX_FILE, so "git commit -a" and partial commits
+# are covered.
+changed=$(git diff --cached --name-only)
+[ -n "$changed" ] || exit 0
+
+mode=${CLAUDE_INTERACTIVE_PRECOMMIT_TESTS:-auto}
+run_tests=0
+case $mode in
+  always) run_tests=1 ;;
+  never) run_tests=0 ;;
+  *)
+    if printf '%s\n' "$changed" | grep -Eq '^(bin/|scripts/|tests/|\.githooks/|action\.yml$)'; then
+      run_tests=1
+    fi
+    ;;
+esac
+
+# 1. Forgotten files: the suite runs on the snapshot, so a driver or test
+# file that exists only in the working tree would make it fail for the wrong
+# reason. Say so right away instead.
+if [ "$run_tests" = 1 ]; then
+  forgotten=$(git ls-files --others --exclude-standard -- bin tests)
+  if [ -n "$forgotten" ]; then
+    say "these files exist but are not staged:"
+    # shellcheck disable=SC2086 # one path per word
+    printf '    %s\n' $forgotten >&2
+    fail "add them with git add, or remove them"
+  fi
+fi
+
+git_dir=$(git rev-parse --absolute-git-dir)
+snap=$(mktemp -d "${TMPDIR:-/tmp}/claude-interactive-precommit.XXXXXX")
+trap 'rm -rf "$snap"' EXIT
+git checkout-index --all --prefix="$snap/"
+cd "$snap"
+
+# Everything below runs on the snapshot only; git's hook environment must
+# not leak into the tests.
+unset GIT_INDEX_FILE GIT_DIR GIT_WORK_TREE GIT_PREFIX
+
+shell_files=""
+yaml_files=""
+fake_changed=0
+# shellcheck disable=SC2086 # paths in this repo contain no spaces
+for f in $changed; do
+  [ -f "$f" ] || continue # deleted by this commit
+  case $f in
+    bin/claude-interactive | scripts/*.sh | tests/run.sh | .githooks/*) shell_files="$shell_files $f" ;;
+    action.yml | .github/workflows/*.yml) yaml_files="$yaml_files $f" ;;
+    tests/fake-claude) fake_changed=1 ;;
+  esac
+done
+
+# 2. Syntax
+for f in $shell_files; do
+  bash -n "$f" >&2 || fail "syntax error in $f"
+done
+if [ "$fake_changed" = 1 ] && command -v python3 >/dev/null 2>&1; then
+  python3 -I -c 'import ast, sys; ast.parse(open(sys.argv[1]).read(), sys.argv[1])' tests/fake-claude ||
+    fail "syntax error in tests/fake-claude"
+fi
+[ -z "$shell_files" ] && [ "$fake_changed" = 0 ] || say "syntax ok"
+
+# 3. shellcheck
+if [ -n "$shell_files" ]; then
+  if command -v shellcheck >/dev/null 2>&1; then
+    # shellcheck disable=SC2086 # list of paths without spaces
+    shellcheck -x $shell_files >&2 || fail "shellcheck reported problems"
+    say "shellcheck ok"
+  else
+    say "shellcheck not installed, skipped (CI runs it; install it to check locally)"
+  fi
+fi
+
+# 4. YAML
+if [ -n "$yaml_files" ] && command -v ruby >/dev/null 2>&1; then
+  # shellcheck disable=SC2086
+  ruby -ryaml -e 'ARGV.each { |f| YAML.load_file(f) }' $yaml_files >&2 || fail "invalid YAML"
+  say "yaml ok"
+fi
+
+# 5. Offline test suite
+if [ "$run_tests" = 0 ]; then
+  say "no driver, test or action changes staged, test suite skipped"
+  exit 0
+fi
+[ -f tests/run.sh ] || fail "the commit changes the driver but tests/run.sh is not in it"
+
+# macOS /bin/bash is 3.2, the oldest bash the driver supports.
+test_bash=/bin/bash
+[ -x "$test_bash" ] || test_bash=$(command -v bash)
+log=$git_dir/precommit-tests.log
+# shellcheck disable=SC2016 # expanded by the child bash
+say "running the offline test suite with bash $("$test_bash" -c 'echo $BASH_VERSION') (takes about 90s)..."
+if "$test_bash" tests/run.sh >"$log" 2>&1; then
+  say "tests ok: $(grep -E '^[0-9]+ passed' "$log" | tail -n 1)"
+  exit 0
+fi
+summary=$(grep -E '^[0-9]+ passed' "$log" | tail -n 1 || true)
+say "first failures:"
+grep -E -A 4 '^FAIL' "$log" | head -n 25 >&2 || tail -n 25 "$log" >&2
+fail "test suite failed (${summary:-no summary}); full log: $log"
