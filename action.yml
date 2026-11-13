@@ -1,0 +1,235 @@
+name: Claude Code Interactive Run
+description: >-
+  Run the interactive Claude Code TUI unattended inside tmux, submit one or
+  more prompts as conversation turns, and get a JSON report of the session.
+author: xAlcahest
+branding:
+  icon: terminal
+  color: orange
+
+inputs:
+  prompt:
+    description: Prompt for a single turn. Combine with prompt-files to add more turns after it.
+    required: false
+    default: ''
+  prompt-files:
+    description: Newline-separated prompt files, one turn each, submitted in order after `prompt`.
+    required: false
+    default: ''
+  workdir:
+    description: Directory Claude Code runs in. It is marked as trusted during setup.
+    required: false
+    default: '.'
+  oauth-token:
+    description: Claude Code OAuth token, as created by `claude setup-token`. Pass it from a secret.
+    required: false
+    default: ''
+  api-key:
+    description: Anthropic API key, as an alternative to oauth-token. Pass it from a secret.
+    required: false
+    default: ''
+  base-config:
+    description: Optional JSON merged into ~/.claude.json before setup, for example an exported config. Pass it from a secret.
+    required: false
+    default: ''
+  model:
+    description: Model alias or full model name.
+    required: false
+    default: ''
+  permission-mode:
+    description: bypassPermissions, acceptEdits, auto, dontAsk, manual or plan.
+    required: false
+    default: bypassPermissions
+  timeout:
+    description: Deadline for the whole run, in seconds.
+    required: false
+    default: '1800'
+  turn-timeout:
+    description: Deadline for each turn, in seconds (0 disables it).
+    required: false
+    default: '0'
+  claude-version:
+    description: >-
+      Claude Code npm version to install. Pin it: the TUI changes between
+      releases. Use 'preinstalled' to skip the installation.
+    required: false
+    default: latest
+  claude-args:
+    description: Newline-separated extra arguments passed to claude.
+    required: false
+    default: ''
+  extra-args:
+    description: Newline-separated extra arguments passed to `claude-interactive run`.
+    required: false
+    default: ''
+  output-dir:
+    description: Directory for the run artifacts. Defaults to a fresh directory under runner.temp.
+    required: false
+    default: ''
+  upload-artifact:
+    description: Upload the run artifacts (report, events, screen, transcript) with actions/upload-artifact.
+    required: false
+    default: 'true'
+  artifact-name:
+    description: Name of the uploaded artifact.
+    required: false
+    default: claude-interactive
+  artifact-retention-days:
+    description: Retention for the uploaded artifact.
+    required: false
+    default: '7'
+  fail-on-error:
+    description: Fail the step when the run does not succeed. When 'false', check the status output instead.
+    required: false
+    default: 'true'
+
+outputs:
+  status:
+    description: success, startup_failed, submit_failed, auth_failed, claude_exited, timeout, blocked, api_error, interrupted or error.
+    value: ${{ steps.run.outputs.status }}
+  exit-code:
+    description: Exit code of claude-interactive.
+    value: ${{ steps.run.outputs.exit-code }}
+  session-id:
+    description: Claude Code session id.
+    value: ${{ steps.run.outputs.session-id }}
+  final-message:
+    description: Last assistant message of the last completed turn (truncated to 100 KB).
+    value: ${{ steps.run.outputs.final-message }}
+  cost-usd:
+    description: Total cost reported by Claude Code, when available.
+    value: ${{ steps.run.outputs.cost-usd }}
+  result-file:
+    description: Path of result.json.
+    value: ${{ steps.run.outputs.result-file }}
+  output-dir:
+    description: Path of the artifact directory.
+    value: ${{ steps.run.outputs.output-dir }}
+
+runs:
+  using: composite
+  steps:
+    - name: Install tmux and jq
+      shell: bash
+      run: |
+        missing=""
+        command -v tmux >/dev/null 2>&1 || missing="$missing tmux"
+        command -v jq >/dev/null 2>&1 || missing="$missing jq"
+        if [ -z "$missing" ]; then exit 0; fi
+        echo "Installing:$missing"
+        case "$RUNNER_OS" in
+          Linux) sudo apt-get update -qq && sudo apt-get install -y -qq $missing ;;
+          macOS) brew install $missing ;;
+          *) echo "::error::unsupported runner OS: $RUNNER_OS"; exit 1 ;;
+        esac
+
+    - name: Install Claude Code
+      shell: bash
+      env:
+        CLAUDE_VERSION: ${{ inputs.claude-version }}
+      run: |
+        if [ "$CLAUDE_VERSION" != preinstalled ]; then
+          npm install -g "@anthropic-ai/claude-code@${CLAUDE_VERSION}"
+        fi
+        claude --version
+
+    - name: Prepare Claude Code configuration
+      shell: bash
+      env:
+        WORKDIR: ${{ inputs.workdir }}
+        BASE_CONFIG: ${{ inputs.base-config }}
+      run: |
+        args=(--trust "$WORKDIR")
+        if [ -n "$BASE_CONFIG" ]; then
+          printf '%s' "$BASE_CONFIG" | CI=true "$GITHUB_ACTION_PATH/bin/claude-interactive" setup "${args[@]}" --base-config -
+        else
+          CI=true "$GITHUB_ACTION_PATH/bin/claude-interactive" setup "${args[@]}"
+        fi
+
+    - name: Run Claude Code
+      id: run
+      shell: bash
+      env:
+        INPUT_PROMPT: ${{ inputs.prompt }}
+        INPUT_PROMPT_FILES: ${{ inputs.prompt-files }}
+        INPUT_WORKDIR: ${{ inputs.workdir }}
+        INPUT_OAUTH_TOKEN: ${{ inputs.oauth-token }}
+        INPUT_API_KEY: ${{ inputs.api-key }}
+        INPUT_MODEL: ${{ inputs.model }}
+        INPUT_PERMISSION_MODE: ${{ inputs.permission-mode }}
+        INPUT_TIMEOUT: ${{ inputs.timeout }}
+        INPUT_TURN_TIMEOUT: ${{ inputs.turn-timeout }}
+        INPUT_CLAUDE_ARGS: ${{ inputs.claude-args }}
+        INPUT_EXTRA_ARGS: ${{ inputs.extra-args }}
+        INPUT_OUTPUT_DIR: ${{ inputs.output-dir }}
+        INPUT_FAIL_ON_ERROR: ${{ inputs.fail-on-error }}
+      run: |
+        set -uo pipefail
+
+        if [ -n "$INPUT_OAUTH_TOKEN" ]; then export CLAUDE_CODE_OAUTH_TOKEN="$INPUT_OAUTH_TOKEN"; fi
+        if [ -n "$INPUT_API_KEY" ]; then export ANTHROPIC_API_KEY="$INPUT_API_KEY"; fi
+        if [ -z "$INPUT_OAUTH_TOKEN$INPUT_API_KEY" ]; then
+          echo "::warning::neither oauth-token nor api-key is set; relying on credentials already on the runner"
+        fi
+
+        out=${INPUT_OUTPUT_DIR:-$RUNNER_TEMP/claude-interactive/$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$RANDOM}
+        args=(--workdir "$INPUT_WORKDIR" --output-dir "$out" --timeout "$INPUT_TIMEOUT"
+              --turn-timeout "$INPUT_TURN_TIMEOUT" --permission-mode "$INPUT_PERMISSION_MODE")
+        if [ -n "$INPUT_MODEL" ]; then args+=(--model "$INPUT_MODEL"); fi
+        if [ -n "$INPUT_PROMPT" ]; then args+=(--prompt "$INPUT_PROMPT"); fi
+        while IFS= read -r line; do
+          if [ -n "$line" ]; then args+=(--prompt-file "$line"); fi
+        done <<< "$INPUT_PROMPT_FILES"
+        while IFS= read -r line; do
+          if [ -n "$line" ]; then args+=(--claude-arg "$line"); fi
+        done <<< "$INPUT_CLAUDE_ARGS"
+        while IFS= read -r line; do
+          if [ -n "$line" ]; then args+=("$line"); fi
+        done <<< "$INPUT_EXTRA_ARGS"
+
+        # Actions runs bash with -e; capture the exit code instead of dying
+        # here, so outputs and the summary are written for failed runs too.
+        rc=0
+        "$GITHUB_ACTION_PATH/bin/claude-interactive" run "${args[@]}" >/dev/null || rc=$?
+
+        result="$out/result.json"
+        delim="EOF_$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')"
+        {
+          echo "exit-code=$rc"
+          echo "output-dir=$out"
+          if [ -f "$result" ]; then
+            echo "result-file=$result"
+            echo "status=$(jq -r '.status' "$result")"
+            echo "session-id=$(jq -r '.session_id // ""' "$result")"
+            echo "cost-usd=$(jq -r '.usage.total_cost_usd // ""' "$result")"
+            echo "final-message<<$delim"
+            head -c 100000 "$out/final-message.txt"
+            echo
+            echo "$delim"
+          else
+            echo "status=error"
+          fi
+        } >> "$GITHUB_OUTPUT"
+
+        if [ -f "$result" ]; then
+          {
+            echo "### Claude Code interactive run"
+            echo
+            jq -r '"- Status: `\(.status)` (exit \(.exit_code))",
+                   "- Turns: \(.turns_completed)/\(.turns_total) in \(.duration_seconds)s",
+                   "- Claude Code: \(.claude_version // "unknown")",
+                   (if .usage.total_cost_usd then "- Cost: $\(.usage.total_cost_usd * 10000 | round / 10000)" else empty end),
+                   (if .status != "success" then "- Reason: \(.reason)" else empty end)' "$result"
+          } >> "$GITHUB_STEP_SUMMARY"
+        fi
+
+        if [ "$rc" -ne 0 ] && [ "$INPUT_FAIL_ON_ERROR" = true ]; then exit "$rc"; fi
+        exit 0
+
+    - name: Upload run artifacts
+      if: always() && inputs.upload-artifact == 'true' && steps.run.outputs.output-dir != ''
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ inputs.artifact-name }}
+        path: ${{ steps.run.outputs.output-dir }}
+        retention-days: ${{ inputs.artifact-retention-days }}

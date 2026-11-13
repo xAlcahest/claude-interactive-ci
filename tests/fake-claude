@@ -1,0 +1,1133 @@
+#!/usr/bin/env -S python3 -I
+# -*- coding: utf-8 -*-
+"""fake-claude: offline stand-in for the interactive Claude Code TUI.
+
+The test suite points bin/claude-interactive at this file with --claude-bin.
+It mimics what the driver relies on, as observed on Claude Code 2.1.314:
+
+  * argv: claude --settings FILE|JSON [--dangerously-skip-permissions |
+    --permission-mode M] [--model M] [--disallowedTools LIST] ... [--] [PROMPT]
+    Unknown flags are accepted and ignored. --version prints a version line.
+  * hooks: every .hooks.<Event>[].hooks[].command in the settings is run with
+    `sh -c`, the JSON payload on stdin, and waited for (honoring "timeout").
+    Stop payloads carry "background_tasks" and "session_crons".
+  * startup: optional dialogs first (no hooks yet), then SessionStart, then the
+    PROMPT from argv is submitted as turn 1 (UserPromptSubmit, work, Stop).
+  * terminal: raw mode, bracketed paste enabled (ESC[?2004h). A paste
+    (ESC[200~ ... ESC[201~) inserts text, CR inside a paste is a newline, a
+    plain CR submits, `/exit` + CR fires SessionEnd and exits 0. Every change
+    redraws the whole screen (clear + home) so capture-pane shows the state.
+  * background tasks: when one ends, Claude Code itself submits a
+    <task-notification> prompt (UserPromptSubmit without "source", new
+    prompt_id) and runs a turn for it. Typing /exit while a task still runs
+    opens the "Background work is running" dialog (numbered options,
+    "1. Exit and stop tasks" preselected).
+  * transcript: JSONL at transcript_path; on /exit a final "cost-state" line.
+
+Environment (all optional):
+  FAKE_CLAUDE_SCENARIO  Comma-separated behaviors, default "ok":
+      ok                  no dialogs, each turn replies and fires Stop
+      trust               workspace trust dialog ("No, exit" preselected);
+                          skipped when $CLAUDE_CONFIG_DIR/.claude.json has
+                          projects[cwd or an ancestor].hasTrustDialogAccepted
+      bypass              Bypass Permissions warning, only when bypass mode is
+                          requested; skipped when $CLAUDE_CONFIG_DIR/settings.json
+                          has skipDangerousModePermissionPrompt
+      trust_bypass        trust,bypass
+      theme               onboarding "Choose the text style" picker
+      api_key             "Detected a custom API key" dialog, cursor on
+                          "No (recommended)", "Yes" is the option above it
+      unknown_dialog      a blocking dialog no built-in rule knows
+                          ("Frobnicator", "No, exit" preselected)
+      login               login wizard "Select login method:", waits forever
+      login_exit          prints "Not logged in" and exits 1
+      stop_failure        turn N fires StopFailure (error $FAKE_CLAUDE_ERROR,
+                          default rate_limit) instead of Stop
+      permission          turn N fires Notification ($FAKE_CLAUDE_NOTIFY_TYPE,
+                          default permission_prompt) and waits forever
+      hang                turn N never ends
+      crash               turn N exits with $FAKE_CLAUDE_EXIT_STATUS (default 3)
+                          after UserPromptSubmit
+      ignore_input        from turn N on every keystroke is discarded (N=2)
+      ignore_input_turn2  same as ignore_input
+      ignore_enter        the first Enter that would submit turn N is
+                          swallowed, the next one works (N=2)
+      ignore_enter_turn2  same as ignore_enter
+      injected_prompt     during turn N, a UserPromptSubmit with source "loop"
+                          and its own Stop fire before the real Stop
+      rewrite_prompt      the UserPromptSubmit "prompt" of turn N differs from
+                          the typed text ("Rewritten: " prefix)
+      idle_notify         $FAKE_CLAUDE_IDLE_AFTER s (default 0.3) after each
+                          finished turn a Notification idle_prompt fires
+      echo_env            default reply reports CLAUDECODE and
+                          CLAUDE_CODE_SESSION_ID as the TUI sees them
+      bg_running          turn N stops with a running background task; after
+                          $FAKE_CLAUDE_BG_AFTER s (default 2) the task ends and
+                          the notification turn ends with the final answer
+      bg_race             turn N stops with no task running, then after
+                          $FAKE_CLAUDE_BG_AFTER s (default 0.5) the
+                          notification turn runs as above
+      bg_stuck            turn N stops with a background task that never ends
+      bg_permission       like bg_running, but the notification turn asks for
+                          permission (Notification) and waits forever
+      notify_on_paste     after turn N, the next paste first triggers a
+                          notification turn ("LATE NOTIFICATION REPLY")
+      orphan_child        turn N starts `sh -c 'trap "" HUP TERM; exec sleep
+                          300'` in its own session, then hangs
+  FAKE_CLAUDE_TURN      Turn N for the turn-level behaviors (default 1, or 2
+                        for ignore_input/ignore_enter).
+  FAKE_CLAUDE_REPLY     Reply template, default "ECHO: {first_line}".
+                        Placeholders: {first_line} {turn} {prompt_chars}
+                        {prompt_lines} {prompt_sha256} {env:NAME}.
+  FAKE_CLAUDE_DELAY     Seconds of "work" per turn (default 0.2).
+  FAKE_CLAUDE_BG_AFTER  Seconds until a background task ends (see bg_*).
+  FAKE_CLAUDE_BG_REPLY  Reply of the notification turn (default
+                        "BACKGROUND DONE: final answer").
+  FAKE_CLAUDE_IGNORE_SIGNALS  1 = ignore SIGHUP/SIGTERM and keep running
+                        after the terminal goes away (a slow shutdown).
+  FAKE_CLAUDE_STARTUP_DELAY  Seconds before the first screen (default 0).
+  FAKE_CLAUDE_NUMBERED  1 renders menu options as "1. label".
+  FAKE_CLAUDE_MENU_WRAP 1 makes Down on the last option wrap to the first.
+  FAKE_CLAUDE_VERSION   Printed by --version (default "2.1.314 (Claude Code)").
+  FAKE_CLAUDE_HOME      Transcripts (projects/<cwd>/<session>.jsonl) and pid
+                        files (pids/<pid>, also for spawned children).
+                        Default: $CLAUDE_CONFIG_DIR, else $TMPDIR/fake-claude-<uid>.
+  FAKE_CLAUDE_LOG       JSONL file the mock appends records to, each with a
+                        "kind":
+      start    pid, argv, cwd, session_id, transcript_path, settings_arg,
+               permission_mode, model, initial_prompt, isatty, env (CLAUDE*,
+               FAKE_CLAUDE*, ANTHROPIC*, TERM, TMUX, CI; secrets redacted),
+               env_names (names of every variable)
+      dialog   name, choice (label, or null for Esc)
+      prompt   turn, source ("argv" or "input"), prompt_id, text
+      injected turn, prompt_id, text (a <task-notification> prompt)
+      child    child_pid (orphan_child)
+      ignored  what (input the scenario discarded)
+      hook     event, command, rc, stdout, stderr, timed_out
+      exit     status, reason
+
+Only the standard library is used; Python 3.9+, runs under `python3 -I`.
+"""
+
+import collections
+import hashlib
+import json
+import os
+import re
+import select
+import signal
+import subprocess
+import sys
+import textwrap
+import time
+import uuid
+
+try:
+    import termios
+    import tty
+except ImportError:  # pragma: no cover - not a POSIX system
+    termios = None
+    tty = None
+
+POINTER = "❯"
+DEFAULT_VERSION = "2.1.314 (Claude Code)"
+WORKING = "✻ Working… (esc to interrupt)"
+CONFIRM = "Enter to confirm · Esc to cancel"
+
+# Options that consume the next argument. Everything else starting with "-"
+# is treated as a flag and ignored when unknown.
+VALUE_OPTIONS = {
+    "--settings", "--permission-mode", "--model", "--allowedTools",
+    "--allowed-tools", "--disallowedTools", "--disallowed-tools",
+    "--append-system-prompt", "--append-system-prompt-file", "--system-prompt",
+    "--system-prompt-file", "--mcp-config", "--add-dir", "--session-id",
+    "--fallback-model", "--output-format", "--input-format", "--agents",
+    "--agent", "--setting-sources", "--plugin-dir", "--betas", "--max-turns",
+    "--max-budget-usd", "--json-schema", "--permission-prompt-tool", "--tools",
+}
+
+ALIASES = {
+    "trust_bypass": ("trust", "bypass"),
+    "ignore_input_turn2": ("ignore_input",),
+    "ignore_enter_turn2": ("ignore_enter",),
+}
+
+PASTE_START = b"\x1b[200~"
+PASTE_END = b"\x1b[201~"
+CSI_RE = re.compile(rb"\x1b\[([0-9;?]*)([ -/]*)([@-~])")
+CSI_PARTIAL_RE = re.compile(rb"\x1b(\[[0-9;?]*[ -/]*|O)?")
+SS3_RE = re.compile(rb"\x1bO([A-Za-z])")
+CSI_KEYS = {b"A": "up", b"B": "down", b"C": "right", b"D": "left",
+            b"H": "home", b"F": "end", b"Z": "shift_tab",
+            b"I": "focus_in", b"O": "focus_out"}
+
+
+def env_float(name, default):
+    try:
+        return float(os.environ.get(name, default))
+    except ValueError:
+        return float(default)
+
+
+def now_iso():
+    t = time.time()
+    return time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(t)) + ".%03dZ" % int((t % 1) * 1000)
+
+
+def display_safe(s):
+    """Make text safe to print on the terminal (no control sequences)."""
+    s = s.replace("\t", "    ")
+    return re.sub(r"[\x00-\x09\x0b-\x1f\x7f]", "?", s)
+
+
+class Log(object):
+    def __init__(self, path):
+        self.path = path or ""
+
+    def write(self, kind, **fields):
+        if not self.path:
+            return
+        rec = {"kind": kind, "t": round(time.time(), 3), "pid": os.getpid()}
+        rec.update(fields)
+        data = (json.dumps(rec, ensure_ascii=True) + "\n").encode("ascii")
+        try:
+            fd = os.open(self.path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        except OSError:
+            return
+        try:
+            while data:
+                n = os.write(fd, data)
+                data = data[n:]
+        finally:
+            os.close(fd)
+
+
+class Options(object):
+    def __init__(self):
+        self.version = False
+        self.help = False
+        self.settings_arg = None
+        self.skip_permissions = False
+        self.permission_mode = None
+        self.model = None
+        self.values = {}
+        self.unknown = []
+        self.positional = []
+
+    @classmethod
+    def parse(cls, argv):
+        o = cls()
+        i = 0
+        while i < len(argv):
+            a = argv[i]
+            if a == "--":
+                o.positional.extend(argv[i + 1:])
+                break
+            name, value, has_value = a, None, False
+            if a.startswith("--") and "=" in a:
+                name, value = a.split("=", 1)
+                has_value = True
+            if name in ("--version", "-v"):
+                o.version = True
+            elif name in ("--help", "-h"):
+                o.help = True
+            elif name == "--dangerously-skip-permissions":
+                o.skip_permissions = True
+            elif name in VALUE_OPTIONS:
+                if not has_value:
+                    if i + 1 < len(argv):
+                        value = argv[i + 1]
+                        i += 1
+                    else:
+                        value = ""
+                o.values.setdefault(name, []).append(value)
+                if name == "--settings":
+                    o.settings_arg = value
+                elif name == "--permission-mode":
+                    o.permission_mode = value
+                elif name == "--model":
+                    o.model = value
+            elif a.startswith("-") and a != "-":
+                o.unknown.append(a)
+            else:
+                o.positional.append(a)
+            i += 1
+        return o
+
+    @property
+    def effective_permission_mode(self):
+        if self.skip_permissions:
+            return "bypassPermissions"
+        return self.permission_mode or "default"
+
+
+class Term(object):
+    """Raw-mode terminal with bracketed paste and full-screen redraws."""
+
+    def __init__(self):
+        self.saved = None
+        self.last_frame = None
+        if termios is not None and os.isatty(0):
+            try:
+                self.saved = termios.tcgetattr(0)
+                tty.setraw(0)
+            except termios.error:
+                self.saved = None
+        self.write("\x1b[?2004h")
+
+    def restore(self):
+        self.write("\x1b[?2004l")
+        if self.saved is not None:
+            try:
+                termios.tcsetattr(0, termios.TCSADRAIN, self.saved)
+            except termios.error:
+                pass
+            self.saved = None
+
+    def write(self, s):
+        data = s.encode("utf-8", "replace")
+        while data:
+            try:
+                n = os.write(1, data)
+            except InterruptedError:
+                continue
+            except OSError:
+                return
+            data = data[n:]
+
+    def size(self):
+        try:
+            sz = os.get_terminal_size(1)
+            return max(sz.columns, 40), max(sz.lines, 10)
+        except OSError:
+            return 200, 50
+
+    def render(self, lines):
+        cols, rows = self.size()
+        width = cols - 2
+        out = []
+        for line in lines:
+            line = display_safe(line)
+            if len(line) <= width:
+                out.append(line)
+                continue
+            indent = len(line) - len(line.lstrip(" "))
+            out.extend(textwrap.wrap(line, width=width, subsequent_indent=" " * min(indent, 8),
+                                     replace_whitespace=False, drop_whitespace=True) or [""])
+        out = out[-(rows - 1):]
+        frame = "\r\n".join(out)
+        if frame == self.last_frame:
+            return
+        self.last_frame = frame
+        self.write("\x1b[2J\x1b[H" + frame)
+
+
+class Keys(object):
+    """Turns raw terminal bytes into key events, one at a time."""
+
+    def __init__(self, fd=0):
+        self.fd = fd
+        self.buf = b""
+        self.events = collections.deque()
+        self.in_paste = False
+        self.eof = False
+
+    def _fill(self, timeout):
+        """Read more bytes. Returns False when the timeout expired."""
+        try:
+            ready, _, _ = select.select([self.fd], [], [], timeout)
+        except InterruptedError:
+            return True
+        if not ready:
+            return False
+        try:
+            data = os.read(self.fd, 65536)
+        except OSError:
+            data = b""
+        if not data:
+            self.eof = True
+        else:
+            self.buf += data
+        return True
+
+    def next(self, timeout=None):
+        """Next event, or None when `timeout` seconds pass without one.
+
+        Raises EOFError when the terminal went away."""
+        deadline = None if timeout is None else time.monotonic() + timeout
+        while True:
+            if self.events:
+                return self.events.popleft()
+            if self.buf:
+                self._parse(final=False)
+                if self.events:
+                    continue
+            if self.eof:
+                raise EOFError
+            if self.buf and not self.in_paste:
+                # An incomplete escape sequence: give the rest 50 ms to arrive,
+                # then take it as a lone Esc.
+                if not self._fill(0.05):
+                    self._parse(final=True)
+                continue
+            remaining = None
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return None
+            self._fill(remaining)
+
+    def _parse(self, final):
+        buf = self.buf
+        i = 0
+        text = bytearray()
+
+        def flush_text():
+            if text:
+                self.events.append(("text", bytes(text)))
+                del text[:]
+
+        while i < len(buf):
+            if self.in_paste:
+                j = buf.find(PASTE_END, i)
+                if j < 0:
+                    keep = 0
+                    for k in range(min(len(PASTE_END) - 1, len(buf) - i), 0, -1):
+                        if PASTE_END.startswith(buf[len(buf) - k:]):
+                            keep = k
+                            break
+                    if len(buf) - keep > i:
+                        self.events.append(("paste", buf[i:len(buf) - keep]))
+                    i = len(buf) - keep
+                    break
+                if j > i:
+                    self.events.append(("paste", buf[i:j]))
+                self.events.append(("paste_end", None))
+                self.in_paste = False
+                i = j + len(PASTE_END)
+                continue
+            b = buf[i]
+            if b == 0x1b:
+                rest = buf[i:]
+                if rest.startswith(PASTE_START):
+                    flush_text()
+                    self.in_paste = True
+                    self.events.append(("paste_start", None))
+                    i += len(PASTE_START)
+                    continue
+                m = CSI_RE.match(rest)
+                if m:
+                    flush_text()
+                    self.events.append(("key", CSI_KEYS.get(m.group(3), "csi")))
+                    i += m.end()
+                    continue
+                m = SS3_RE.match(rest)
+                if m:
+                    flush_text()
+                    self.events.append(("key", CSI_KEYS.get(m.group(1), "ss3")))
+                    i += m.end()
+                    continue
+                if not final and CSI_PARTIAL_RE.fullmatch(rest):
+                    break  # wait for the rest of the sequence
+                flush_text()
+                self.events.append(("key", "esc"))
+                i += 1
+                continue
+            if b == 0x0d:
+                flush_text()
+                self.events.append(("key", "enter"))
+            elif b == 0x0a:
+                flush_text()
+                self.events.append(("key", "newline"))
+            elif b in (0x7f, 0x08):
+                flush_text()
+                self.events.append(("key", "backspace"))
+            elif b == 0x03:
+                flush_text()
+                self.events.append(("key", "ctrl_c"))
+            elif b == 0x04:
+                flush_text()
+                self.events.append(("key", "ctrl_d"))
+            elif b == 0x15:
+                flush_text()
+                self.events.append(("key", "ctrl_u"))
+            elif b == 0x09:
+                flush_text()
+                self.events.append(("key", "tab"))
+            elif b < 0x20:
+                pass
+            else:
+                text.append(b)
+            i += 1
+        flush_text()
+        self.buf = buf[i:]
+
+
+class Exit(Exception):
+    def __init__(self, status, reason, message=None):
+        Exception.__init__(self, reason)
+        self.status = status
+        self.reason = reason
+        self.message = message
+
+
+class Hooks(object):
+    def __init__(self, app, settings):
+        hooks = settings.get("hooks") if isinstance(settings, dict) else None
+        self.config = hooks if isinstance(hooks, dict) else {}
+        self.app = app
+
+    def fire(self, event, extra, match=None):
+        app = self.app
+        payload = {
+            "session_id": app.session_id,
+            "transcript_path": app.transcript_path,
+            "cwd": app.cwd,
+            "hook_event_name": event,
+        }
+        payload.update(extra)
+        data = json.dumps(payload).encode("utf-8")
+        env = dict(os.environ)
+        env["CLAUDE_PROJECT_DIR"] = app.cwd
+        for group in self.config.get(event) or []:
+            if not isinstance(group, dict):
+                continue
+            matcher = group.get("matcher")
+            if matcher not in (None, "", "*") and match is not None:
+                try:
+                    if not re.fullmatch(matcher, match):
+                        continue
+                except re.error:
+                    if matcher != match:
+                        continue
+            for hook in group.get("hooks") or []:
+                if not isinstance(hook, dict) or hook.get("type", "command") != "command":
+                    continue
+                command = hook.get("command")
+                if not command:
+                    continue
+                try:
+                    timeout = float(hook.get("timeout") or 60)
+                except (TypeError, ValueError):
+                    timeout = 60.0
+                rc, out, err, timed_out = None, b"", b"", False
+                try:
+                    proc = subprocess.run(["/bin/sh", "-c", command], input=data,
+                                          stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                          timeout=timeout, cwd=app.cwd, env=env)
+                    rc, out, err = proc.returncode, proc.stdout, proc.stderr
+                except subprocess.TimeoutExpired as e:
+                    timed_out = True
+                    out, err = e.stdout or b"", e.stderr or b""
+                except OSError as e:
+                    err = str(e).encode()
+                app.log.write("hook", event=event, command=command, rc=rc,
+                              stdout=out.decode("utf-8", "replace"),
+                              stderr=err.decode("utf-8", "replace"), timed_out=timed_out)
+
+
+def load_settings(arg):
+    if not arg:
+        return {}
+    try:
+        if arg.lstrip().startswith("{"):
+            return json.loads(arg)
+        with open(arg, "rb") as f:
+            return json.loads(f.read().decode("utf-8"))
+    except (OSError, ValueError):
+        return {}
+
+
+def load_json(path):
+    try:
+        with open(path, "rb") as f:
+            data = json.loads(f.read().decode("utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+class App(object):
+    def __init__(self, opts):
+        self.opts = opts
+        self.log = Log(os.environ.get("FAKE_CLAUDE_LOG"))
+        raw = os.environ.get("FAKE_CLAUDE_SCENARIO", "ok") or "ok"
+        self.scenario = set()
+        for name in raw.split(","):
+            name = name.strip()
+            if name:
+                self.scenario.update(ALIASES.get(name, (name,)))
+        self.delay = env_float("FAKE_CLAUDE_DELAY", 0.2)
+        self.numbered = os.environ.get("FAKE_CLAUDE_NUMBERED") == "1"
+        self.menu_wrap = os.environ.get("FAKE_CLAUDE_MENU_WRAP") == "1"
+        self.ignore_signals = os.environ.get("FAKE_CLAUDE_IGNORE_SIGNALS") == "1"
+        self.session_id = str(uuid.uuid4())
+        self.cwd = os.getcwd()
+        home = os.environ.get("FAKE_CLAUDE_HOME") or os.environ.get("CLAUDE_CONFIG_DIR")
+        if not home:
+            home = os.path.join(os.environ.get("TMPDIR", "/tmp"), "fake-claude-%d" % os.getuid())
+        self.home = home
+        self.transcript_path = os.path.join(home, "projects", re.sub(r"[^A-Za-z0-9]", "-", self.cwd),
+                                            self.session_id + ".jsonl")
+        self.permission_mode = opts.effective_permission_mode
+        self.model = opts.model or "claude-fake-1"
+        self.settings = load_settings(opts.settings_arg)
+        self.hooks = Hooks(self, self.settings)
+        self.term = None
+        self.keys = Keys(0)
+        self.history = []
+        self.status = None
+        self.input = bytearray()
+        self.turn = 0
+        self.completed = 0
+        self.parent_uuid = None
+        self.enter_swallowed = False
+        self.ignored_logged = False
+        self.last_ctrl_c = 0.0
+        self.pid_file = None
+        self.timers = []  # [due (monotonic), name, callback]
+        self.bg_tasks = []  # background tasks still running
+        self.task_seq = 0
+        self.paste_notification = None
+
+    # --- helpers -------------------------------------------------------------
+    def has(self, name):
+        return name in self.scenario
+
+    def target_turn(self, name):
+        value = os.environ.get("FAKE_CLAUDE_TURN")
+        if value:
+            try:
+                return int(value)
+            except ValueError:
+                pass
+        return 2 if name in ("ignore_input", "ignore_enter") else 1
+
+    def at(self, name, turn):
+        return self.has(name) and turn == self.target_turn(name)
+
+    def env_snapshot(self):
+        snap = {}
+        for k, v in os.environ.items():
+            if k.startswith(("CLAUDE", "FAKE_CLAUDE", "ANTHROPIC")) or k in ("TERM", "TMUX", "CI", "IS_SANDBOX"):
+                if re.search(r"TOKEN|KEY|SECRET|PASSWORD|AUTH", k):
+                    v = "<redacted>"
+                snap[k] = v
+        return snap
+
+    def write_pid(self, pid):
+        try:
+            d = os.path.join(self.home, "pids")
+            os.makedirs(d, exist_ok=True)
+            path = os.path.join(d, str(pid))
+            with open(path, "w") as f:
+                f.write("%d\n" % pid)
+            return path
+        except OSError:
+            return None
+
+    def transcript(self, entry):
+        try:
+            os.makedirs(os.path.dirname(self.transcript_path), exist_ok=True)
+            with open(self.transcript_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(entry) + "\n")
+        except OSError:
+            pass
+
+    def transcript_message(self, kind, message, extra=None):
+        u = str(uuid.uuid4())
+        entry = {"parentUuid": self.parent_uuid, "isSidechain": False, "userType": "external",
+                 "cwd": self.cwd, "sessionId": self.session_id, "version": "2.1.314",
+                 "type": kind, "message": message, "uuid": u, "timestamp": now_iso()}
+        if extra:
+            entry.update(extra)
+        self.parent_uuid = u
+        self.transcript(entry)
+
+    def reply_for(self, text, turn):
+        template = os.environ.get("FAKE_CLAUDE_REPLY")
+        if template is None:
+            if self.has("echo_env"):
+                template = "ENV CLAUDECODE={env:CLAUDECODE} CLAUDE_CODE_SESSION_ID={env:CLAUDE_CODE_SESSION_ID}"
+            else:
+                template = "ECHO: {first_line}"
+
+        def sub(m):
+            key = m.group(1)
+            if key.startswith("env:"):
+                return os.environ.get(key[4:], "<unset>")
+            if key == "first_line":
+                return text.split("\n", 1)[0]
+            if key == "turn":
+                return str(turn)
+            if key == "prompt_chars":
+                return str(len(text))
+            if key == "prompt_lines":
+                return str(text.count("\n") + 1)
+            if key == "prompt_sha256":
+                return hashlib.sha256(text.encode("utf-8")).hexdigest()
+            return m.group(0)
+
+        return re.sub(r"\{(first_line|turn|prompt_chars|prompt_lines|prompt_sha256|env:[A-Za-z_][A-Za-z0-9_]*)\}",
+                      sub, template)
+
+    # --- screens -------------------------------------------------------------
+    def main_lines(self, hint=None):
+        cols, _ = self.term.size()
+        lines = [" ✻ Welcome to Claude Code!", "",
+                 "   /help for help, /status for your current setup", "",
+                 "   cwd: " + self.cwd, ""]
+        for kind, text in self.history:
+            body = text.split("\n")
+            if len(body) > 12:
+                body = body[:12] + ["... +%d lines" % (len(body) - 12)]
+            body = [b[:600] for b in body]
+            if kind == "user":
+                lead = "> "
+            elif kind == "assistant":
+                lead = "⏺ "
+            else:
+                lead = "  ⎿  "
+            lines.append(lead + body[0])
+            lines.extend("  " + b for b in body[1:])
+            lines.append("")
+        if self.status:
+            lines.extend([self.status, ""])
+        sep = "─" * (cols - 2)
+        lines.append(sep)
+        text = self.input.decode("utf-8", "replace")
+        n_lines = text.count("\n") + 1
+        if len(text) > 800 or n_lines > 10:
+            lines.append(POINTER + " [Pasted text #1 +%d lines]" % n_lines)
+        else:
+            parts = text.split("\n")
+            lines.append(POINTER + " " + parts[0])
+            lines.extend("  " + p for p in parts[1:])
+        lines.append(sep)
+        if hint:
+            lines.append("  " + hint)
+        elif self.bg_tasks:
+            lines.append("  %d background task%s · ↓ to view" % (len(self.bg_tasks),
+                                                                        "" if len(self.bg_tasks) == 1 else "s"))
+        elif self.permission_mode == "bypassPermissions":
+            lines.append("  ⏵⏵ bypass permissions on (shift+tab to cycle)")
+        else:
+            lines.append("  ? for shortcuts")
+        return lines
+
+    def render_main(self, hint=None):
+        self.term.render(self.main_lines(hint))
+
+    def menu(self, name, header, options, cursor=0, footer=CONFIRM, numbered=None):
+        """Show a select menu until Enter (returns the index) or Esc (None)."""
+        if numbered is None:
+            numbered = self.numbered
+        while True:
+            lines = list(header) + [""]
+            for i, opt in enumerate(options):
+                label = ("%d. %s" % (i + 1, opt)) if numbered else opt
+                lines.append((" " + POINTER + " " if i == cursor else "   ") + label)
+            lines += ["", " " + footer]
+            self.term.render(lines)
+            kind, value = self.keys.next()
+            if kind != "key":
+                continue
+            if value == "down":
+                if cursor + 1 < len(options):
+                    cursor += 1
+                elif self.menu_wrap:
+                    cursor = 0
+            elif value == "up":
+                if cursor > 0:
+                    cursor -= 1
+                elif self.menu_wrap:
+                    cursor = len(options) - 1
+            elif value == "enter":
+                self.log.write("dialog", name=name, choice=options[cursor])
+                return cursor
+            elif value == "esc":
+                self.log.write("dialog", name=name, choice=None)
+                return None
+
+    # --- startup ---------------------------------------------------------------
+    def workspace_trusted(self):
+        d = os.environ.get("CLAUDE_CONFIG_DIR")
+        if not d:
+            return False
+        projects = load_json(os.path.join(d, ".claude.json")).get("projects")
+        if not isinstance(projects, dict):
+            return False
+        path = self.cwd
+        while True:
+            entry = projects.get(path)
+            if isinstance(entry, dict) and entry.get("hasTrustDialogAccepted") is True:
+                return True
+            parent = os.path.dirname(path)
+            if parent == path:
+                return False
+            path = parent
+
+    def bypass_prompt_skipped(self):
+        if self.settings.get("skipDangerousModePermissionPrompt") is True:
+            return True
+        d = os.environ.get("CLAUDE_CONFIG_DIR")
+        return bool(d) and load_json(os.path.join(d, "settings.json")).get("skipDangerousModePermissionPrompt") is True
+
+    def dialogs(self):
+        if self.has("theme"):
+            self.menu("theme", [" Let's get started.", "",
+                                " Choose the text style that looks best with your terminal",
+                                " To change this later, run /theme"],
+                      ["Dark mode", "Light mode", "Dark mode (colorblind-friendly)",
+                       "Light mode (colorblind-friendly)"])
+        if self.has("login"):
+            self.term.render([" Welcome to Claude Code v2.1.314", "",
+                              " Claude Code can be used with your Claude subscription or billed based on API usage"
+                              " through your Console account.", "",
+                              " Select login method:", "",
+                              " " + POINTER + " 1. Claude account with subscription · Pro, Max, Team, or Enterprise",
+                              "", "   2. Anthropic Console account · API usage billing", "",
+                              "   3. 3rd-party platform · Amazon Bedrock, Microsoft Foundry, or Vertex AI"])
+            self.wait_forever()
+        if self.has("login_exit"):
+            raise Exit(1, "not logged in", "Not logged in · Please run /login")
+        if self.has("trust") and not self.workspace_trusted():
+            choice = self.menu("trust", [
+                " Accessing workspace:", "", " " + self.cwd, "",
+                " Quick safety check: Is this a project you created or one you trust? (Like your own code, a"
+                " well-known open source project, or work from your team). If not, take a moment to review"
+                " what's in this folder first.", "",
+                " Claude Code'll be able to read, edit, and execute files here.", "",
+                " Security guide"], ["No, exit", "Yes, I trust this folder"])
+            if choice != 1:
+                raise Exit(1, "workspace not trusted")
+        if self.has("api_key"):
+            self.menu("api_key", [" Detected a custom API key in your environment", "",
+                                  " ANTHROPIC_API_KEY: sk-ant-...fake", "",
+                                  " Do you want to use this API key?"],
+                      ["Yes", "No (recommended)"], cursor=1)
+        if self.has("bypass") and self.permission_mode == "bypassPermissions" and not self.bypass_prompt_skipped():
+            choice = self.menu("bypass", [
+                " WARNING: Claude Code running in Bypass Permissions mode", "",
+                " In Bypass Permissions mode, Claude Code will not ask for your approval before running"
+                " potentially dangerous commands.",
+                " This mode should only be used in a sandboxed container/VM that has restricted internet"
+                " access and can easily be restored if damaged.", "",
+                " By proceeding, you accept all responsibility for actions taken while running in Bypass"
+                " Permissions mode.", "", " https://code.claude.com/docs/en/security"],
+                ["No, exit", "Yes, I accept"], footer="Enter to confirm · Esc to exit")
+            if choice != 1:
+                raise Exit(1, "bypass mode declined")
+        if self.has("unknown_dialog"):
+            choice = self.menu("unknown_dialog", [
+                " Frobnicator settings changed", "",
+                " Claude Code now frobnicates by default. Do you want to keep frobnicating?"],
+                ["No, exit", "Yes, keep frobnicating"])
+            if choice != 1:
+                raise Exit(1, "frobnicator declined")
+
+    # --- waiting and timers ------------------------------------------------------
+    def wait_forever(self):
+        while True:
+            try:
+                self.keys.next()
+            except EOFError:
+                if not self.ignore_signals:
+                    raise
+                while True:  # a stubborn process: keep running without a terminal
+                    time.sleep(1)
+
+    def add_timer(self, delay, name, callback):
+        self.timers.append([time.monotonic() + delay, name, callback])
+
+    def run_due_timers(self):
+        now = time.monotonic()
+        due = sorted((t for t in self.timers if t[0] <= now), key=lambda t: t[0])
+        self.timers = [t for t in self.timers if t[0] > now]
+        for t in due:
+            t[2]()
+
+    # --- turns -----------------------------------------------------------------
+    def new_task(self, status="running"):
+        self.task_seq += 1
+        return {"id": "b3h4l7d5%d" % self.task_seq, "type": "shell", "status": status,
+                "description": "Run the slow job in the background", "command": "sleep 90"}
+
+    def ask_permission(self):
+        time.sleep(self.delay)
+        ntype = os.environ.get("FAKE_CLAUDE_NOTIFY_TYPE", "permission_prompt")
+        self.term.render(self.main_lines()[:-4] + [
+            " Bash command", "", "   rm -rf build", "   Remove build output", "",
+            " Do you want to proceed?",
+            " " + POINTER + " 1. Yes",
+            "   2. Yes, and don't ask again for rm commands in " + self.cwd,
+            "   3. No, and tell Claude what to do differently (esc)"])
+        self.hooks.fire("Notification", {"message": "Claude needs your permission to use Bash",
+                                         "title": "Claude Code", "notification_type": ntype}, match=ntype)
+        self.wait_forever()
+
+    def finish_turn(self, prompt_id, reply, turn):
+        """Show the reply, then fire Stop with the tasks still running."""
+        self.transcript_message("assistant", {"id": "msg_fake_%d" % turn, "type": "message",
+                                              "role": "assistant", "model": self.model,
+                                              "content": [{"type": "text", "text": reply}],
+                                              "stop_reason": "end_turn",
+                                              "usage": {"input_tokens": 1, "output_tokens": 1}})
+        self.history.append(("assistant", reply))
+        self.status = None
+        self.completed += 1
+        self.render_main()
+        self.hooks.fire("Stop", {"prompt_id": prompt_id, "stop_hook_active": False,
+                                 "last_assistant_message": reply,
+                                 "background_tasks": [dict(t) for t in self.bg_tasks],
+                                 "session_crons": []})
+
+    def notification_turn(self, task, ask_permission=False, reply=None):
+        """Claude Code waking the model up because a background task ended."""
+        task["status"] = "completed"
+        if task in self.bg_tasks:
+            self.bg_tasks.remove(task)
+        prompt_id = str(uuid.uuid4())
+        text = ("<task-notification>\n<task-id>%s</task-id>\n<status>completed</status>\n"
+                "<summary>Background command \"%s\" completed (exit code 0)</summary>\n"
+                "</task-notification>" % (task["id"], task["command"]))
+        self.log.write("injected", turn=self.turn, prompt_id=prompt_id, text=text)
+        self.hooks.fire("UserPromptSubmit", {"prompt_id": prompt_id, "permission_mode": self.permission_mode,
+                                             "prompt": text})
+        self.transcript_message("user", {"role": "user", "content": text}, {"promptId": prompt_id})
+        self.history.append(("error", "Background command \"%s\" completed" % task["command"]))
+        self.status = WORKING
+        self.render_main()
+        if ask_permission:
+            self.ask_permission()
+        time.sleep(self.delay)
+        if reply is None:
+            reply = os.environ.get("FAKE_CLAUDE_BG_REPLY", "BACKGROUND DONE: final answer")
+        self.finish_turn(prompt_id, reply, self.turn)
+
+    def run_turn(self, text, source):
+        self.turn += 1
+        n = self.turn
+        prompt_id = str(uuid.uuid4())
+        self.log.write("prompt", turn=n, source=source, prompt_id=prompt_id, text=text)
+        submitted = ("Rewritten: " + text) if self.at("rewrite_prompt", n) else text
+        self.hooks.fire("UserPromptSubmit", {"prompt_id": prompt_id, "permission_mode": self.permission_mode,
+                                             "prompt": submitted})
+        self.transcript_message("user", {"role": "user", "content": text}, {"promptId": prompt_id})
+        self.history.append(("user", text))
+        self.status = WORKING
+        self.render_main()
+
+        if self.at("injected_prompt", n):
+            other = str(uuid.uuid4())
+            self.hooks.fire("UserPromptSubmit", {"prompt_id": other, "permission_mode": self.permission_mode,
+                                                 "prompt": "<scheduled loop tick>", "source": "loop"})
+            self.hooks.fire("Stop", {"prompt_id": other, "stop_hook_active": False,
+                                     "last_assistant_message": "INJECTED REPLY",
+                                     "background_tasks": [], "session_crons": []})
+        if self.at("orphan_child", n):
+            child = subprocess.Popen(["/bin/sh", "-c", 'trap "" HUP TERM; exec sleep 300'],
+                                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                     stderr=subprocess.DEVNULL, start_new_session=True)
+            self.write_pid(child.pid)
+            self.log.write("child", child_pid=child.pid)
+            self.wait_forever()
+        if self.at("crash", n):
+            time.sleep(self.delay)
+            status = int(os.environ.get("FAKE_CLAUDE_EXIT_STATUS", "3"))
+            raise Exit(status, "crash", "Error: simulated crash (exit status %d)" % status)
+        if self.at("hang", n):
+            self.wait_forever()
+        if self.at("permission", n):
+            self.ask_permission()
+
+        time.sleep(self.delay)
+        if self.at("stop_failure", n):
+            err = os.environ.get("FAKE_CLAUDE_ERROR", "rate_limit")
+            msg = "API Error: Rate limit reached" if err == "rate_limit" else "API Error: " + err
+            self.history.append(("error", msg))
+            self.status = None
+            self.render_main()
+            self.hooks.fire("StopFailure", {"prompt_id": prompt_id, "error": err,
+                                            "error_details": "429 {\"type\":\"error\",\"error\":{\"type\":\"%s\"}}" % err,
+                                            "last_assistant_message": msg})
+            return
+
+        bg_after = None
+        if self.at("bg_running", n) or self.at("bg_stuck", n) or self.at("bg_permission", n):
+            task = self.new_task()
+            self.bg_tasks.append(task)
+            if not self.at("bg_stuck", n):
+                bg_after = env_float("FAKE_CLAUDE_BG_AFTER", 2.0)
+        elif self.at("bg_race", n):
+            task = self.new_task(status="completed")
+            bg_after = env_float("FAKE_CLAUDE_BG_AFTER", 0.5)
+        self.finish_turn(prompt_id, self.reply_for(text, n), n)
+        if bg_after is not None:
+            ask = self.at("bg_permission", n)
+            self.add_timer(bg_after, "bg", lambda: self.notification_turn(task, ask_permission=ask))
+        if self.at("notify_on_paste", n):
+            self.paste_notification = self.new_task(status="completed")
+        if self.has("idle_notify"):
+            self.add_timer(env_float("FAKE_CLAUDE_IDLE_AFTER", 0.3), "idle", self.idle_notification)
+
+    def idle_notification(self):
+        self.hooks.fire("Notification", {"message": "Claude is waiting for your input",
+                                         "title": "Claude Code", "notification_type": "idle_prompt"},
+                        match="idle_prompt")
+
+    def end_session(self, reason):
+        n = self.completed
+        self.transcript({"type": "cost-state", "totalCostUSD": round(0.01 * n, 6),
+                         "totalAPIDuration": 10 * n, "totalLinesAdded": 0, "totalLinesRemoved": 0,
+                         "modelUsage": {"fake": {"inputTokens": n, "outputTokens": n}}})
+        self.history.append(("error", "Goodbye!"))
+        self.render_main()
+        self.hooks.fire("SessionEnd", {"reason": reason})
+        raise Exit(0, reason)
+
+    def exit_requested(self):
+        if self.bg_tasks:
+            header = [" Background work is running", "", " The following will stop when you exit:", ""]
+            header += [" %s · %s" % (t["type"], t["command"]) for t in self.bg_tasks]
+            choice = self.menu("exit_background", header,
+                               ["Exit and stop tasks", "Move to background and exit", "Stay"], numbered=True)
+            if choice not in (0, 1):
+                self.render_main()
+                return
+            if choice == 0:
+                for t in self.bg_tasks:
+                    t["status"] = "killed"
+                self.bg_tasks = []
+        self.end_session("prompt_input_exit")
+
+    def ignoring_input(self):
+        return self.has("ignore_input") and self.turn + 1 >= self.target_turn("ignore_input")
+
+    def submit(self):
+        text = self.input.decode("utf-8", "replace")
+        if not text.strip():
+            return
+        if text.strip() in ("/exit", "/quit"):
+            self.input = bytearray()
+            self.exit_requested()
+            return
+        if self.has("ignore_enter") and not self.enter_swallowed and \
+                self.turn + 1 == self.target_turn("ignore_enter"):
+            self.enter_swallowed = True
+            self.log.write("ignored", what="enter")
+            return
+        self.input = bytearray()
+        self.run_turn(text, "input")
+
+    def handle(self, ev):
+        kind, value = ev
+        if kind == "paste_start":
+            if self.paste_notification is not None:
+                task, self.paste_notification = self.paste_notification, None
+                self.notification_turn(task, reply="LATE NOTIFICATION REPLY")
+            return
+        if kind == "paste_end":
+            self.render_main()
+            return
+        if kind == "paste":
+            self.input += value.replace(b"\r", b"\n")
+            return
+        if kind == "text":
+            self.input += value
+            self.render_main()
+            return
+        if value == "enter":
+            self.submit()
+        elif value == "newline":
+            self.input += b"\n"
+        elif value == "backspace":
+            while self.input and 0x80 <= self.input[-1] < 0xC0:
+                self.input.pop()
+            if self.input:
+                self.input.pop()
+        elif value == "ctrl_u":
+            self.input = bytearray()
+        elif value in ("ctrl_c", "ctrl_d"):
+            if self.input and value == "ctrl_c":
+                self.input = bytearray()
+            elif not self.input:
+                if time.monotonic() - self.last_ctrl_c < 2.0:
+                    self.exit_requested()
+                    return
+                self.last_ctrl_c = time.monotonic()
+                self.render_main(hint="Press Ctrl-C again to exit")
+                return
+        else:
+            return
+        self.render_main()
+
+    def idle_loop(self):
+        while True:
+            timeout = None
+            if self.timers:
+                timeout = max(0.0, min(t[0] for t in self.timers) - time.monotonic())
+            ev = self.keys.next(timeout)
+            if ev is None:
+                self.run_due_timers()
+                continue
+            # Typing resets the idle notification timer, as in the real TUI.
+            self.timers = [t for t in self.timers if t[1] != "idle"]
+            if self.ignoring_input():
+                if not self.ignored_logged:
+                    self.ignored_logged = True
+                    self.log.write("ignored", what="input")
+                continue
+            self.handle(ev)
+
+    def run(self):
+        initial = " ".join(self.opts.positional) if self.opts.positional else None
+        self.log.write("start", argv=sys.argv[1:], cwd=self.cwd, session_id=self.session_id,
+                       transcript_path=self.transcript_path, settings_arg=self.opts.settings_arg,
+                       permission_mode=self.permission_mode, model=self.opts.model,
+                       initial_prompt=initial, isatty=os.isatty(0),
+                       env=self.env_snapshot(), env_names=sorted(os.environ))
+        self.pid_file = self.write_pid(os.getpid())
+        if self.ignore_signals:
+            signal.signal(signal.SIGHUP, signal.SIG_IGN)
+            signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        status, reason, message = 0, "exit", None
+        self.term = Term()
+        try:
+            time.sleep(env_float("FAKE_CLAUDE_STARTUP_DELAY", 0))
+            self.dialogs()
+            self.hooks.fire("SessionStart", {"source": "startup", "model": self.model}, match="startup")
+            self.render_main()
+            if initial is not None:
+                self.run_turn(initial, "argv")
+            self.idle_loop()
+        except Exit as e:
+            status, reason, message = e.status, e.reason, e.message
+        except EOFError:
+            status, reason = 129, "terminal closed"
+        finally:
+            self.term.restore()
+            if message:
+                self.term.write("\r\n" + message + "\r\n")
+            self.log.write("exit", status=status, reason=reason)
+            if self.pid_file:
+                try:
+                    os.unlink(self.pid_file)
+                except OSError:
+                    pass
+        return status
+
+
+def main():
+    opts = Options.parse(sys.argv[1:])
+    if opts.version:
+        sys.stdout.write(os.environ.get("FAKE_CLAUDE_VERSION", DEFAULT_VERSION) + "\n")
+        return 0
+    if opts.help:
+        sys.stdout.write(__doc__)
+        return 0
+    return App(opts).run()
+
+
+if __name__ == "__main__":
+    sys.exit(main())
