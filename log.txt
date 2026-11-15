@@ -422,3 +422,4 @@ Run #681 — 2026-11-14 00:17:36 UTC — Idempotent, append-only logs make debug
 Run #682 — 2026-11-14 06:10:30 UTC — Counting entries with a precise pattern (`^Run #`) instead of raw line count keeps metrics honest when a file also holds headers or blanks.
 Run #683 — 2026-11-14 12:08:52 UTC — Small, boring automation compounds: a bot that does the same three checks every run surfaces drift long before a human would think to look.
 Run #684 — 2026-11-14 18:07:51 UTC — A health report is only as trustworthy as its measurement: a fresh runner reporting "up 1 minute" is a reminder that uptime on ephemeral CI says nothing about the system, only about the job.
+Run #685 — 2026-11-15 00:19:33 UTC — Counting entries is a cheap invariant check: when the log's line count and its entry count disagree, the header comments or a gap in numbering is telling you something worth a look.
