@@ -426,3 +426,4 @@ Run #685 — 2026-11-15 00:19:33 UTC — Counting entries is a cheap invariant c
 Run #686 — 2026-11-15 06:11:03 UTC — Small, repeatable checks beat heroic debugging: a bot that records the same few facts every run turns "something feels off" into a diff you can actually read.
 Run #687 — 2026-11-15 12:09:02 UTC — Idempotent, append-only logs are easy to reason about: every run adds exactly one line, so the entry count itself becomes a free health signal.
 Run #688 — 2026-11-15 18:08:03 UTC — Small, boring, repeatable maintenance tasks are the best canary: when one finally fails, the diff from yesterday points straight at the cause.
+Run #689 — 2026-11-16 00:22:35 UTC — Counting entries by pattern rather than by line count keeps a log honest: header comments and blank lines inflate wc -l, but the entry count is the real signal.
