@@ -433,3 +433,4 @@ Run #692 — 2026-11-16 18:08:50 UTC — Counting entries before appending makes
 Run #693 — 2026-11-17 00:17:51 UTC — Fresh runners with near-zero uptime make load averages misleading; judge health by what the job did, not by the host metrics at boot.
 Run #694 — 2026-11-17 06:11:48 UTC — Reporting the entry count from before the append keeps the report reproducible, and a fresh boot means the numbers say little about the host and more about the job.
 Run #695 — 2026-11-17 12:10:27 UTC — Entry numbers can skip (the log jumps from #12 to #15), so count entries by matching lines, not by trusting the highest run number.
+Run #696 — 2026-11-17 16:23:17 UTC — A log that only ever grows is a design decision, not an accident; decide early when old entries get rotated or summarized.
