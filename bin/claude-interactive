@@ -1,0 +1,1362 @@
+#!/usr/bin/env bash
+#
+# claude-interactive: run the interactive Claude Code TUI unattended in tmux.
+#
+# Claude Code is started inside a private tmux server and driven with
+# keystrokes, the same way a person at a terminal would drive it. Turn
+# boundaries are not guessed from the screen. The driver registers Claude Code
+# hooks (SessionStart, UserPromptSubmit, Stop, StopFailure, Notification,
+# SessionEnd) through --settings, and every hook drops its JSON payload into an
+# event directory that the driver polls. A turn is complete when a Stop event
+# arrives carrying the prompt_id of the UserPromptSubmit event for that turn.
+#
+# The screen is only read to get past startup dialogs (workspace trust,
+# bypass-permissions confirmation, onboarding) and to explain failures.
+#
+# Requirements: bash >= 3.2, tmux >= 3.0, jq >= 1.6, Claude Code CLI.
+
+set -euo pipefail
+
+CI_VERSION="0.1.0"
+
+# --- Hook recorder ------------------------------------------------------------
+# Claude Code runs this as: <bash> <this file> __hook <Event> <events-dir>
+# It must print nothing (stdout of SessionStart and UserPromptSubmit hooks is
+# injected into the model context) and must always exit 0.
+hook_record() {
+  local event=$1 dir=$2 tmp n limit
+  case $event in '' | *[!A-Za-z]*) cat >/dev/null; return 0 ;; esac
+  if [ ! -d "$dir" ]; then cat >/dev/null; return 0; fi
+  tmp=$(mktemp "$dir/.incoming.XXXXXX" 2>/dev/null) || { cat >/dev/null; return 0; }
+  cat >"$tmp" 2>/dev/null || true
+  mkdir -p "$dir/.seq" 2>/dev/null || true
+  # mkdir is atomic, which makes it a lock-free sequence allocator that works
+  # the same on Linux and macOS.
+  # shellcheck disable=SC2012 # the entries are plain numbers
+  n=$(ls "$dir/.seq" 2>/dev/null | wc -l | tr -d ' ')
+  limit=$((n + 10000))
+  while ! mkdir "$dir/.seq/$n" 2>/dev/null; do
+    n=$((n + 1))
+    if [ "$n" -gt "$limit" ]; then rm -f "$tmp"; return 0; fi
+  done
+  # The rename is atomic, so the driver never sees a half-written file.
+  mv -f "$tmp" "$dir/$(printf '%06d' "$n")-$event.json" 2>/dev/null || rm -f "$tmp"
+  return 0
+}
+
+if [ "${1:-}" = "__hook" ]; then
+  hook_record "${2:-}" "${3:-}" >/dev/null 2>&1 || true
+  exit 0
+fi
+
+# --- Helpers ------------------------------------------------------------------
+QUIET=0
+DRIVER_LOG=""
+
+log() {
+  local line
+  line="[$(date -u +%H:%M:%S)] $*"
+  if [ "$QUIET" != 1 ]; then printf '%s\n' "$line" >&2; fi
+  if [ -n "$DRIVER_LOG" ]; then printf '%s\n' "$line" >>"$DRIVER_LOG" 2>/dev/null || true; fi
+}
+warn() { log "WARN: $*"; }
+die() { printf 'claude-interactive: %s\n' "$1" >&2; exit "${2:-1}"; }
+die_usage() {
+  printf 'claude-interactive: %s\n' "$1" >&2
+  printf "Run 'claude-interactive %s --help' for usage.\n" "${2:-}" >&2
+  exit 2
+}
+
+# Quote a string for a POSIX shell.
+shq() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
+iso_now() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+cgrep() { LC_ALL=C grep "$@"; }
+is_uint() { case ${1:-} in '' | *[!0-9]*) return 1 ;; esac; }
+physical_dir() { (cd "$1" 2>/dev/null && pwd -P); }
+need_value() { [ $# -ge 2 ] || die_usage "option $1 needs a value" "${CMD:-}"; }
+
+# Escape a message for a GitHub Actions workflow command.
+gha_escape() {
+  local s=$1
+  s=${s//'%'/'%25'}
+  s=${s//$'\r'/'%0D'}
+  s=${s//$'\n'/'%0A'}
+  printf '%s' "$s"
+}
+
+self_path() {
+  local dir
+  dir=$(cd "$(dirname "$0")" && pwd -P)
+  printf '%s/%s' "$dir" "$(basename "$0")"
+}
+
+# Environment variables that identify a parent Claude Code session. Leaving
+# them in place makes the child believe it is nested inside another session.
+PARENT_SESSION_VARS="CLAUDECODE CLAUDE_CODE_ENTRYPOINT CLAUDE_CODE_SESSION_ID
+CLAUDE_CODE_CHILD_SESSION CLAUDE_CODE_SESSION_ATTENDED CLAUDE_CODE_MESSAGING_SOCKET
+CLAUDE_CODE_MESSAGING_TOKEN CLAUDE_CODE_EXECPATH CLAUDE_CODE_SSE_PORT CLAUDE_PID
+CLAUDE_AGENT_SDK_VERSION"
+
+claude_config_file() {
+  if [ -n "${CLAUDE_CONFIG_DIR:-}" ]; then
+    printf '%s/.claude.json' "$CLAUDE_CONFIG_DIR"
+  else
+    printf '%s/.claude.json' "$HOME"
+  fi
+}
+
+claude_settings_file() {
+  printf '%s/settings.json' "${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+}
+
+# =============================================================================
+# run
+# =============================================================================
+
+usage_run() {
+  cat <<'EOF'
+Usage: claude-interactive run [options] [--] [PROMPT ...]
+
+Starts Claude Code in its interactive TUI inside a private tmux server and
+submits each prompt as one conversation turn, in order, waiting for the
+previous turn to finish. Every positional PROMPT, --prompt and --prompt-file
+adds a turn. When the last turn is done the driver types /exit and writes a
+report.
+
+Prompts:
+  -p, --prompt TEXT             Add a turn.
+  -f, --prompt-file FILE        Add a turn read from FILE ('-' reads stdin).
+
+Claude Code:
+  -C, --workdir DIR             Directory Claude Code runs in (default: current).
+  -m, --model MODEL             Model alias or full model name.
+      --permission-mode MODE    bypassPermissions (default), acceptEdits, auto,
+                                dontAsk, manual or plan. If Claude stops to ask
+                                for permission the run fails as "blocked".
+      --allowed-tools LIST      Passed to --allowedTools.
+      --disallowed-tools LIST   Passed to --disallowedTools.
+      --allow-questions         Keep the AskUserQuestion tool. It is disabled
+                                by default because nobody is there to answer.
+      --no-wait-background      End a turn at its first Stop even when Claude
+                                left background tasks running. By default the
+                                driver waits until Claude has picked up their
+                                results and stops with nothing left running.
+      --append-system-prompt TEXT
+                                Passed to --append-system-prompt.
+      --settings FILE|JSON      Extra settings, merged with the driver's hooks.
+      --claude-bin PATH         Claude Code executable (default: $CLAUDE_BIN,
+                                then 'claude' from PATH).
+      --claude-arg ARG          Extra raw argument for claude (repeatable).
+
+Timing (seconds):
+  -t, --timeout N               Deadline for the whole run (default: 1800).
+      --turn-timeout N          Deadline for each turn (default: 0, none).
+      --startup-timeout N       Time allowed until the first prompt is
+                                accepted (default: 120).
+      --submit-timeout N        Time allowed for a later prompt to be accepted
+                                after it is pasted (default: 60).
+      --idle-timeout N          Fail when the screen has not changed for N
+                                seconds during a turn (default: 0, disabled).
+
+Startup dialogs:
+      --dialog 'REGEX::LABEL'   Until the first prompt is accepted, when REGEX
+                                matches the screen, move the menu cursor to the
+                                option matching LABEL and press Enter. An empty
+                                LABEL only presses Enter. Both are extended
+                                regular expressions. Repeatable, checked before
+                                the built-in rules.
+      --fatal REGEX             Fail as auth_failed when REGEX shows up before
+                                the first prompt is accepted. Repeatable.
+
+Output:
+  -o, --output-dir DIR          Artifact directory (default:
+                                ${RUNNER_TEMP:-$TMPDIR}/claude-interactive/<run id>).
+      --no-transcript           Do not copy the session transcript.
+      --json                    Print result.json on stdout instead of the
+                                final assistant message.
+      --keep-session            Do not exit Claude or stop tmux at the end and
+                                print the attach command.
+      --cols N, --rows N        Terminal size (default: 200x50).
+      --dry-run                 Prepare the run, print the launch command, stop.
+  -q, --quiet                   Only print errors.
+  -h, --help                    Show this help.
+
+Exit status:
+  0 success              10 a prompt was never accepted   13 timeout
+  1 internal error       11 authentication problem        14 blocked on input
+  2 usage error          12 Claude Code exited early       15 API error in a turn
+  3 missing dependency   130 interrupted
+EOF
+}
+
+status_exit_code() {
+  case $1 in
+    success) echo 0 ;;
+    startup_failed | submit_failed) echo 10 ;;
+    auth_failed) echo 11 ;;
+    claude_exited) echo 12 ;;
+    timeout) echo 13 ;;
+    blocked) echo 14 ;;
+    api_error) echo 15 ;;
+    interrupted) echo 130 ;;
+    *) echo 1 ;;
+  esac
+}
+
+# Options and run state live in globals: bash 3.2 has no associative arrays
+# and the main loop, the event handlers and the finalizer all share them.
+init_run_state() {
+  PROMPT_KINDS=()
+  PROMPT_VALUES=()
+  WORKDIR=""
+  MODEL=""
+  PERMISSION_MODE="bypassPermissions"
+  ALLOWED_TOOLS=""
+  DISALLOWED_TOOLS=""
+  ALLOW_QUESTIONS=0
+  WAIT_BACKGROUND=1
+  PANE_PID=""
+  APPEND_SYSTEM_PROMPT=""
+  EXTRA_SETTINGS=""
+  CLAUDE_BIN_OPT=""
+  EXTRA_CLAUDE_ARGS=()
+  TIMEOUT=1800
+  TURN_TIMEOUT=0
+  STARTUP_TIMEOUT=120
+  IDLE_TIMEOUT=0
+  SUBMIT_TIMEOUT=60
+  USER_DIALOG_TRIGGERS=()
+  USER_DIALOG_LABELS=()
+  USER_FATAL_PATTERNS=()
+  OUT_DIR=""
+  COPY_TRANSCRIPT=1
+  JSON_OUTPUT=0
+  KEEP_SESSION=0
+  COLS=200
+  ROWS=50
+  DRY_RUN=0
+  POLL_INTERVAL=0.5
+  DONE_SETTLE=3
+  # Prompts bigger than this are pasted instead of passed on the command line
+  # (Linux caps a single argv string at 128 KiB).
+  ARGV_PROMPT_LIMIT=65536
+
+  FINAL_STATUS=""
+  FINAL_REASON=""
+  FINALIZED=0
+  TMUX_STARTED=0
+  SESSION_STARTED=0
+  SESSION_STARTED_AT=0
+  SESSION_ID=""
+  TRANSCRIPT_PATH=""
+  SESSION_END_REASON=""
+  CLAUDE_EXIT_STATUS=""
+  TURN_STATUS=()
+  TURN_KEY=()
+  TURN_PROMPT_ID=()
+  TURN_SUBMITTED_AT=()
+  TURN_STARTED_AT=()
+  TURN_FINISHED_AT=()
+  TURN_T0=()
+  TURN_DURATION=()
+  TURN_ERROR=()
+  STARTED_AT=""
+  RUN_T0=0
+}
+
+parse_run_args() {
+  while [ $# -gt 0 ]; do
+    case $1 in
+      -p | --prompt) need_value "$@"; PROMPT_KINDS+=(text); PROMPT_VALUES+=("$2"); shift 2 ;;
+      -f | --prompt-file) need_value "$@"; PROMPT_KINDS+=(file); PROMPT_VALUES+=("$2"); shift 2 ;;
+      -C | --workdir) need_value "$@"; WORKDIR=$2; shift 2 ;;
+      -m | --model) need_value "$@"; MODEL=$2; shift 2 ;;
+      --permission-mode) need_value "$@"; PERMISSION_MODE=$2; shift 2 ;;
+      --allowed-tools) need_value "$@"; ALLOWED_TOOLS=$2; shift 2 ;;
+      --disallowed-tools) need_value "$@"; DISALLOWED_TOOLS=$2; shift 2 ;;
+      --allow-questions) ALLOW_QUESTIONS=1; shift ;;
+      --no-wait-background) WAIT_BACKGROUND=0; shift ;;
+      --append-system-prompt) need_value "$@"; APPEND_SYSTEM_PROMPT=$2; shift 2 ;;
+      --settings) need_value "$@"; EXTRA_SETTINGS=$2; shift 2 ;;
+      --claude-bin) need_value "$@"; CLAUDE_BIN_OPT=$2; shift 2 ;;
+      --claude-arg) need_value "$@"; EXTRA_CLAUDE_ARGS+=("$2"); shift 2 ;;
+      -t | --timeout) need_value "$@"; TIMEOUT=$2; shift 2 ;;
+      --turn-timeout) need_value "$@"; TURN_TIMEOUT=$2; shift 2 ;;
+      --startup-timeout) need_value "$@"; STARTUP_TIMEOUT=$2; shift 2 ;;
+      --submit-timeout) need_value "$@"; SUBMIT_TIMEOUT=$2; shift 2 ;;
+      --idle-timeout) need_value "$@"; IDLE_TIMEOUT=$2; shift 2 ;;
+      --dialog)
+        need_value "$@"
+        case $2 in *::*) ;; *) die_usage "--dialog expects 'REGEX::LABEL'" run ;; esac
+        USER_DIALOG_TRIGGERS+=("${2%%::*}")
+        USER_DIALOG_LABELS+=("${2#*::}")
+        shift 2
+        ;;
+      --fatal) need_value "$@"; USER_FATAL_PATTERNS+=("$2"); shift 2 ;;
+      -o | --output-dir) need_value "$@"; OUT_DIR=$2; shift 2 ;;
+      --no-transcript) COPY_TRANSCRIPT=0; shift ;;
+      --json) JSON_OUTPUT=1; shift ;;
+      --keep-session) KEEP_SESSION=1; shift ;;
+      --cols) need_value "$@"; COLS=$2; shift 2 ;;
+      --rows) need_value "$@"; ROWS=$2; shift 2 ;;
+      --dry-run) DRY_RUN=1; shift ;;
+      -q | --quiet) QUIET=1; shift ;;
+      -h | --help) usage_run; exit 0 ;;
+      --) shift; while [ $# -gt 0 ]; do PROMPT_KINDS+=(text); PROMPT_VALUES+=("$1"); shift; done ;;
+      -*) die_usage "unknown option: $1" run ;;
+      *) PROMPT_KINDS+=(text); PROMPT_VALUES+=("$1"); shift ;;
+    esac
+  done
+
+  [ ${#PROMPT_KINDS[@]} -gt 0 ] || die_usage "no prompt given" run
+  local n
+  for n in "$TIMEOUT" "$TURN_TIMEOUT" "$STARTUP_TIMEOUT" "$SUBMIT_TIMEOUT" "$IDLE_TIMEOUT" "$COLS" "$ROWS"; do
+    is_uint "$n" || die_usage "expected a non-negative integer, got '$n'" run
+  done
+  # Force base 10: bash arithmetic reads "090" as an invalid octal number.
+  TIMEOUT=$((10#$TIMEOUT))
+  TURN_TIMEOUT=$((10#$TURN_TIMEOUT))
+  STARTUP_TIMEOUT=$((10#$STARTUP_TIMEOUT))
+  SUBMIT_TIMEOUT=$((10#$SUBMIT_TIMEOUT))
+  IDLE_TIMEOUT=$((10#$IDLE_TIMEOUT))
+  COLS=$((10#$COLS))
+  ROWS=$((10#$ROWS))
+  [ "$TIMEOUT" -gt 0 ] || die_usage "--timeout must be greater than 0" run
+  if [ "$COLS" -lt 80 ] || [ "$ROWS" -lt 20 ]; then
+    die_usage "terminal must be at least 80x20" run
+  fi
+  case $PERMISSION_MODE in
+    bypassPermissions | acceptEdits | auto | dontAsk | manual | plan | default) ;;
+    *) die_usage "unknown permission mode: $PERMISSION_MODE" run ;;
+  esac
+}
+
+check_run_deps() {
+  local missing="" c
+  for c in tmux jq; do command -v "$c" >/dev/null 2>&1 || missing="$missing $c"; done
+  [ -z "$missing" ] || die "missing dependencies:$missing" 3
+
+  CLAUDE_BIN=${CLAUDE_BIN_OPT:-${CLAUDE_BIN:-claude}}
+  case $CLAUDE_BIN in
+    */*)
+      [ -x "$CLAUDE_BIN" ] || die "Claude Code executable not found: $CLAUDE_BIN" 3
+      # The launch script changes into the workdir first, so a relative path
+      # would no longer resolve there.
+      CLAUDE_BIN="$(cd "$(dirname "$CLAUDE_BIN")" && pwd -P)/$(basename "$CLAUDE_BIN")"
+      ;;
+    *)
+      local resolved
+      resolved=$(command -v "$CLAUDE_BIN" 2>/dev/null) || die "Claude Code executable not found in PATH: $CLAUDE_BIN" 3
+      # 'command -v' can return a shell function or alias name; tmux needs a file.
+      case $resolved in */*) CLAUDE_BIN=$resolved ;; esac
+      ;;
+  esac
+}
+
+# Load prompt texts into turns/NN.prompt.txt. Trailing newlines are dropped.
+materialize_prompts() {
+  local i=0 kind value content stdin_used=0 file
+  while [ "$i" -lt ${#PROMPT_KINDS[@]} ]; do
+    kind=${PROMPT_KINDS[$i]}
+    value=${PROMPT_VALUES[$i]}
+    if [ "$kind" = file ]; then
+      if [ "$value" = - ]; then
+        [ "$stdin_used" = 0 ] || die_usage "stdin can only be read once" run
+        stdin_used=1
+        content=$(cat)
+      else
+        [ -r "$value" ] || die_usage "cannot read prompt file: $value" run
+        content=$(cat "$value")
+      fi
+    else
+      content=$value
+    fi
+    [ -n "$(printf '%s' "$content" | tr -d '[:space:]')" ] || die_usage "turn $((i + 1)) has an empty prompt" run
+    file=$(turn_file "$((i + 1))" prompt.txt)
+    printf '%s' "$content" >"$file"
+    TURN_KEY[i+1]=$(prompt_key_of_file "$file")
+    i=$((i + 1))
+  done
+  TURN_COUNT=$i
+}
+
+turn_file() { printf '%s/turns/%02d.%s' "$OUT_DIR" "$1" "$2"; }
+
+# Comparable form of a prompt: whitespace collapsed, first 200 characters.
+# Used to tell the prompts the driver typed apart from the ones Claude Code
+# injects itself (task notifications carry no distinguishing "source").
+JQ_PROMPT_KEY='def prompt_key: gsub("\\s+"; " ") | sub("^ "; "") | sub(" $"; "") | .[0:200];'
+
+prompt_key_of_file() { jq -Rrs "$JQ_PROMPT_KEY"' prompt_key' <"$1"; }
+
+setup_dialog_rules() {
+  DIALOG_TRIGGERS=(${USER_DIALOG_TRIGGERS[@]+"${USER_DIALOG_TRIGGERS[@]}"})
+  DIALOG_LABELS=(${USER_DIALOG_LABELS[@]+"${USER_DIALOG_LABELS[@]}"})
+  # Every one of these dialogs preselects the option that declines or exits,
+  # so options are always chosen by label and never by position.
+  DIALOG_TRIGGERS+=('Yes, I trust this folder|Do you trust the files in this folder')
+  DIALOG_LABELS+=('Yes, I trust this folder|Yes, proceed')
+  DIALOG_TRIGGERS+=('running in Bypass Permissions mode')
+  DIALOG_LABELS+=('Yes, I accept')
+  DIALOG_TRIGGERS+=('Detected a custom API key in your environment')
+  DIALOG_LABELS+=('Yes')
+  DIALOG_TRIGGERS+=('Choose the text style')
+  DIALOG_LABELS+=('')
+
+  FATAL_PATTERNS=(${USER_FATAL_PATTERNS[@]+"${USER_FATAL_PATTERNS[@]}"})
+  FATAL_PATTERNS+=('Select login method|Please run /login|Invalid API key|OAuth token (has expired|revoked)|authentication_error|disabled Claude subscription access|Failed to authenticate|Not logged in')
+}
+
+# --- tmux ----------------------------------------------------------------------
+tmx() { env -u TMUX tmux -u -L "$TMUX_SOCKET" "$@"; }
+
+write_tmux_conf() {
+  cat >"$INTERNAL_DIR/tmux.conf" <<'EOF'
+set -g default-shell /bin/sh
+set -g default-terminal screen-256color
+set -g remain-on-exit on
+set -g history-limit 100000
+set -g status off
+set -g focus-events on
+set -g escape-time 10
+EOF
+}
+
+write_settings() {
+  local base='{}' prefix qdir ev json
+  if [ -n "$EXTRA_SETTINGS" ]; then
+    if [ -f "$EXTRA_SETTINGS" ]; then
+      base=$(jq -c . "$EXTRA_SETTINGS") || die_usage "--settings file is not valid JSON" run
+    else
+      base=$(printf '%s' "$EXTRA_SETTINGS" | jq -c .) || die_usage "--settings is neither a file nor valid JSON" run
+    fi
+  fi
+  prefix="$(shq "$BASH") $(shq "$SELF") __hook"
+  qdir=$(shq "$EVENTS_DIR")
+  json=$base
+  for ev in SessionStart UserPromptSubmit Stop StopFailure Notification SessionEnd; do
+    json=$(printf '%s' "$json" | jq -c --arg ev "$ev" --arg cmd "$prefix $ev $qdir" \
+      '.hooks[$ev] = ((.hooks[$ev] // []) + [{hooks: [{type: "command", command: $cmd, timeout: 15}]}])')
+  done
+  printf '%s\n' "$json" | jq . >"$INTERNAL_DIR/settings.json"
+}
+
+build_claude_args() {
+  CLAUDE_ARGS=(--settings "$INTERNAL_DIR/settings.json")
+  if [ "$PERMISSION_MODE" = bypassPermissions ]; then
+    CLAUDE_ARGS+=(--dangerously-skip-permissions)
+  else
+    CLAUDE_ARGS+=(--permission-mode "$PERMISSION_MODE")
+  fi
+  [ -z "$MODEL" ] || CLAUDE_ARGS+=(--model "$MODEL")
+  [ -z "$ALLOWED_TOOLS" ] || CLAUDE_ARGS+=(--allowedTools "$ALLOWED_TOOLS")
+  local disallowed=$DISALLOWED_TOOLS
+  if [ "$ALLOW_QUESTIONS" = 0 ]; then
+    disallowed="AskUserQuestion${disallowed:+,$disallowed}"
+  fi
+  [ -z "$disallowed" ] || CLAUDE_ARGS+=(--disallowedTools "$disallowed")
+  [ -z "$APPEND_SYSTEM_PROMPT" ] || CLAUDE_ARGS+=(--append-system-prompt "$APPEND_SYSTEM_PROMPT")
+  CLAUDE_ARGS+=(${EXTRA_CLAUDE_ARGS[@]+"${EXTRA_CLAUDE_ARGS[@]}"})
+}
+
+# The launch script runs inside tmux. It inherits the driver's environment
+# through the private tmux server, so secrets such as CLAUDE_CODE_OAUTH_TOKEN
+# are never written to disk or put on a command line.
+# shellcheck disable=SC2016 # $status and $(cat) belong to the generated script
+write_launch_script() {
+  local f=$INTERNAL_DIR/launch.sh a first_prompt
+  first_prompt=$(turn_file 1 prompt.txt)
+  {
+    printf '#!/bin/sh\n# Generated by claude-interactive %s\n' "$CI_VERSION"
+    printf 'unset %s\n' "$(printf '%s' "$PARENT_SESSION_VARS" | tr '\n' ' ')"
+    printf 'cd %s || exit 97\n' "$(shq "$WORKDIR")"
+    printf '%s' "$(shq "$CLAUDE_BIN")"
+    for a in "${CLAUDE_ARGS[@]}"; do printf ' %s' "$(shq "$a")"; done
+    if [ "$FIRST_PROMPT_MODE" = argv ]; then
+      printf ' -- "$(cat %s)"' "$(shq "$first_prompt")"
+    fi
+    printf '\nstatus=$?\n'
+    printf 'printf "%%s\\n" "$status" > %s\n' "$(shq "$INTERNAL_DIR/claude.exit")"
+    printf 'exit "$status"\n'
+  } >"$f"
+  chmod +x "$f"
+}
+
+start_tmux() {
+  tmx -f "$INTERNAL_DIR/tmux.conf" new-session -d -s main -x "$COLS" -y "$ROWS" \
+    "exec /bin/sh $(shq "$INTERNAL_DIR/launch.sh")"
+  TMUX_STARTED=1
+  PANE_PID=$(tmx display-message -p -t main '#{pane_pid}' 2>/dev/null || true)
+}
+
+# PID and all its descendants that are still alive, from one ps snapshot.
+process_tree() {
+  ps -A -o pid= -o ppid= 2>/dev/null | awk -v root="$1" '
+    { parent[$1] = $2 }
+    END {
+      keep[root] = 1
+      do {
+        changed = 0
+        for (p in parent) if (!(p in keep) && (parent[p] in keep)) { keep[p] = 1; changed = 1 }
+      } while (changed)
+      for (p in keep) if (p in parent) print p
+    }'
+}
+
+capture_screen() { tmx capture-pane -p -t main 2>/dev/null || true; }
+# Keystrokes may race with Claude exiting; a dead pane is detected by the
+# main loop, so a failed send must not abort the driver.
+send_keys() { tmx send-keys -t main "$@" 2>/dev/null || true; }
+capture_history() { tmx capture-pane -p -J -S - -t main 2>/dev/null || true; }
+
+# Prints "<dead> <status>"; a missing pane counts as dead.
+pane_state() {
+  tmx display-message -p -t main '#{pane_dead} #{pane_dead_status}' 2>/dev/null || echo "1 "
+}
+
+paste_prompt() {
+  local i=$1
+  tmx load-buffer -b "turn$i" "$(turn_file "$i" prompt.txt)" 2>/dev/null || true
+  # -p wraps the text in bracketed-paste markers, so newlines inside the
+  # prompt stay newlines instead of submitting it early.
+  tmx paste-buffer -p -d -b "turn$i" -t main 2>/dev/null || true
+  sleep 0.3
+  send_keys Enter
+}
+
+# Killing the tmux server only sends SIGHUP, which Claude Code can take a
+# while to act on, and tool processes may sit in their own process groups.
+# Collect the pane's whole process tree first, then make sure it is gone
+# before the driver reports, so nothing keeps writing to the workdir.
+stop_tmux() {
+  [ "$TMUX_STARTED" = 1 ] || return 0
+  local pids="" alive p i=0
+  if is_uint "${PANE_PID:-}"; then pids=$(process_tree "$PANE_PID" | tr '\n' ' '); fi
+  tmx kill-server 2>/dev/null || true
+  TMUX_STARTED=0
+  [ -n "${pids// /}" ] || return 0
+  # shellcheck disable=SC2086 # pids is a space-separated list on purpose
+  kill -TERM $pids 2>/dev/null || true
+  while :; do
+    alive=""
+    for p in $pids; do
+      if kill -0 "$p" 2>/dev/null; then alive="$alive $p"; fi
+    done
+    [ -n "$alive" ] || return 0
+    if [ "$i" -ge 10 ]; then
+      warn "killing processes that ignored SIGTERM:$alive"
+      # shellcheck disable=SC2086
+      kill -KILL $alive 2>/dev/null || true
+      return 0
+    fi
+    sleep 0.5
+    i=$((i + 1))
+  done
+}
+
+# --- Run state -------------------------------------------------------------------
+finish() {
+  if [ -z "$FINAL_STATUS" ]; then
+    FINAL_STATUS=$1
+    FINAL_REASON=$2
+  fi
+}
+
+# Last meaningful lines of the screen, joined on one line, for error messages.
+# Lines without any letter or digit are TUI decoration (borders, an empty
+# prompt) and are skipped. "Pane is dead" is tmux's own remain-on-exit notice.
+screen_tail() {
+  local out
+  out=$(printf '%s\n' "$1" | LC_ALL=C awk -v k="${2:-6}" '
+    /[A-Za-z0-9]/ && !/^Pane is dead/ { sub(/^[ \t]+/, ""); lines[++n] = $0 }
+    END {
+      start = n - k + 1; if (start < 1) start = 1
+      for (i = start; i <= n; i++) printf "%s%s", (i > start ? " | " : ""), lines[i]
+    }' | cut -c1-400) || true
+  printf '%s' "${out:-(screen empty)}"
+}
+
+match_fatal() {
+  local screen=$1 p
+  for p in "${FATAL_PATTERNS[@]}"; do
+    if printf '%s\n' "$screen" | cgrep -Eq -- "$p"; then
+      printf '%s\n' "$screen" | cgrep -Eo -- "$p" | head -n 1
+      return 0
+    fi
+  done
+  return 1
+}
+
+# Which arrow key moves the menu cursor towards the option matching LABEL:
+# prints Up when the nearest matching option is above the cursor, else Down.
+# Menus do not always wrap around, so always pressing Down can get stuck.
+dialog_direction() {
+  local screen=$1 label=$2 cursor targets
+  cursor=$(printf '%s\n' "$screen" | cgrep -nE -- '❯ +' | head -n 1 | cut -d: -f1) || true
+  targets=$(printf '%s\n' "$screen" |
+    cgrep -nE -- "^[[:space:]]*(❯ +)?([0-9]+\. +)?($label)" | cut -d: -f1) || true
+  if [ -z "$cursor" ] || [ -z "$targets" ]; then echo Down; return 0; fi
+  printf '%s\n' "$targets" | awk -v c="$cursor" '
+    { d = $1 - c; a = d < 0 ? -d : d; if (best == "" || a < best) { best = a; dir = d } }
+    END { print (dir < 0 ? "Up" : "Down") }'
+}
+
+# Press at most one key for a dialog. Returns 1 when TRIGGER does not match.
+# The option is chosen by label: the cursor moves towards the option matching
+# LABEL until it is selected, then Enter confirms. An empty LABEL only presses
+# Enter.
+dialog_rule() {
+  local screen=$1 hash=$2 trigger=$3 label=$4 what=$5 fail_status=$6
+  printf '%s\n' "$screen" | cgrep -Eq -- "$trigger" || return 1
+  # After a keystroke, wait for the screen to change before pressing anything
+  # else: a second Enter could confirm the next dialog, whose default answer
+  # is usually "exit".
+  if [ "$hash" = "$DIALOG_KEY_HASH" ] && [ $((SECONDS - DIALOG_KEY_AT)) -lt 5 ]; then
+    return 0
+  fi
+  DIALOG_KEY_HASH=$hash
+  DIALOG_KEY_AT=$SECONDS
+  if [ -z "$label" ] || printf '%s\n' "$screen" | cgrep -Eq -- "❯ +([0-9]+\. +)?($label)"; then
+    log "$what dialog matched /$trigger/: pressing Enter${label:+ on /$label/}"
+    send_keys Enter
+    DIALOG_MOVES=0
+  else
+    DIALOG_MOVES=$((DIALOG_MOVES + 1))
+    if [ "$DIALOG_MOVES" -gt 15 ]; then
+      if [ -n "$fail_status" ]; then
+        finish "$fail_status" "$what dialog /$trigger/ has no option matching /$label/: $(screen_tail "$screen")"
+      fi
+      return 0
+    fi
+    send_keys "$(dialog_direction "$screen" "$label")"
+  fi
+  return 0
+}
+
+handle_dialogs() {
+  local i=0
+  while [ "$i" -lt ${#DIALOG_TRIGGERS[@]} ]; do
+    if dialog_rule "$1" "$2" "${DIALOG_TRIGGERS[$i]}" "${DIALOG_LABELS[$i]}" Startup startup_failed; then
+      return 0
+    fi
+    i=$((i + 1))
+  done
+  return 1
+}
+
+# Dialogs that /exit can open. When none can be handled the exit timeout
+# takes over and the process tree is stopped.
+handle_exit_dialogs() {
+  dialog_rule "$1" "$2" 'Background work is running' 'Exit and stop tasks' Exit ""
+}
+
+# Pull every new hook event out of the event directory, oldest first.
+ingest_events() {
+  local f base seq
+  for f in "$EVENTS_DIR"/[0-9]*-*.json; do
+    [ -e "$f" ] || continue
+    base=${f##*/}
+    seq=${base%%-*}
+    handle_event "$f" "$((10#$seq))"
+    mv -f "$f" "$EVENTS_DIR/processed/" 2>/dev/null || rm -f "$f"
+  done
+}
+
+handle_event() {
+  local f=$1 seq=$2 fields ev prompt_id source ntype reason err sid tpath bg message cur
+  local sep=$'\x1f'
+  fields=$(jq -r "$JQ_PROMPT_KEY"'
+                  [.hook_event_name, .prompt_id, .source, .notification_type, .reason,
+                   .error, .session_id, .transcript_path,
+                   ([.background_tasks[]? | select(type == "object" and (.status // "running") == "running")] | length),
+                   ((.prompt // "") | prompt_key),
+                   .message]
+                  | map((. // "") | tostring | gsub("[\\t\\r\\n\u001f]"; " ")) | join("\u001f")' "$f" 2>/dev/null) || {
+    warn "ignoring unreadable hook event $(basename "$f")"
+    return 0
+  }
+  IFS=$sep read -r ev prompt_id source ntype reason err sid tpath bg pkey message <<EOF
+$fields
+EOF
+  jq -c --argjson seq "$seq" --arg at "$(iso_now)" '{seq: $seq, received_at: $at} + .' "$f" \
+    >>"$OUT_DIR/events.jsonl" 2>/dev/null || true
+
+  [ -z "$sid" ] || SESSION_ID=$sid
+  [ -z "$tpath" ] || TRANSCRIPT_PATH=$tpath
+  cur=$CUR_TURN
+
+  case $ev in
+    SessionStart)
+      SESSION_STARTED=1
+      SESSION_STARTED_AT=$SECONDS
+      log "Session started (id ${sid:-unknown})"
+      ;;
+    UserPromptSubmit)
+      case $TURN_STATE in
+        submitting)
+          if is_driver_prompt "$cur" "$pkey" "$source"; then
+            TURN_PROMPT_ID[cur]=$prompt_id
+            TURN_STARTED_AT[cur]=$(iso_now)
+            TURN_STATE=running
+            log "Turn $cur/$TURN_COUNT accepted (prompt_id ${prompt_id:-none})"
+          else
+            log "Claude Code injected a prompt while turn $cur was being submitted: ${pkey:0:60}"
+          fi
+          ;;
+        background)
+          log "Turn $cur/$TURN_COUNT resumed by Claude Code: ${pkey:0:60}"
+          ;;
+        done)
+          # Claude Code woke the model up on its own right after the Stop,
+          # typically with a <task-notification> for a background task that
+          # finished. The turn is not over until that work stops too.
+          if [ "$WAIT_BACKGROUND" = 1 ]; then
+            TURN_STATUS[cur]=running
+            TURN_FINISHED_AT[cur]=""
+            TURN_DURATION[cur]=""
+            TURN_STATE=background
+            log "Turn $cur/$TURN_COUNT continues, Claude Code resumed it: ${pkey:0:60}"
+          fi
+          ;;
+      esac
+      ;;
+    Stop)
+      # While background tasks of the turn are pending, Claude Code wakes the
+      # model up again when they finish, under a new prompt_id. The turn is
+      # only over at a Stop with nothing left running.
+      if { [ "$TURN_STATE" = running ] && { [ -z "$prompt_id" ] || [ "$prompt_id" = "${TURN_PROMPT_ID[cur]:-}" ]; }; } ||
+        [ "$TURN_STATE" = background ]; then
+        jq -j '.last_assistant_message // empty' "$f" >"$(turn_file "$cur" response.txt)" 2>/dev/null || true
+        if [ "$WAIT_BACKGROUND" = 1 ] && is_uint "$bg" && [ "$bg" -gt 0 ]; then
+          if [ "$TURN_STATE" != background ]; then
+            log "Turn $cur/$TURN_COUNT paused: $bg background task(s) still running, waiting for them"
+          fi
+          TURN_STATE=background
+        else
+          complete_turn "$cur" completed ""
+          TURN_STATE="done"
+          TURN_DONE_AT=$SECONDS
+          log "Turn $cur/$TURN_COUNT finished in ${TURN_DURATION[cur]}s"
+        fi
+      fi
+      ;;
+    StopFailure)
+      if [ "$TURN_STATE" = running ] || [ "$TURN_STATE" = submitting ] || [ "$TURN_STATE" = background ]; then
+        jq -j '.last_assistant_message // empty' "$f" >"$(turn_file "$cur" response.txt)" 2>/dev/null || true
+        complete_turn "$cur" api_error "${err:-unknown}"
+        TURN_STATE=failed
+        finish api_error "turn $cur ended with an API error: ${err:-unknown}"
+      fi
+      ;;
+    Notification)
+      log "Notification (${ntype:-unknown}): $message"
+      case $ntype in
+        permission_prompt | elicitation_dialog)
+          if [ "$TURN_STATE" = running ] || [ "$TURN_STATE" = submitting ] || [ "$TURN_STATE" = background ]; then
+            complete_turn "$cur" blocked "$ntype"
+            finish blocked "Claude is waiting for human input ($ntype): $message"
+          fi
+          ;;
+        idle_prompt)
+          if [ "$TURN_STATE" = running ]; then
+            complete_turn "$cur" blocked "$ntype"
+            finish blocked "Claude stopped mid-turn waiting for input: $message"
+          fi
+          ;;
+      esac
+      ;;
+    SessionEnd)
+      SESSION_END_REASON=$reason
+      ;;
+  esac
+}
+
+# True when a UserPromptSubmit is the prompt the driver sent for turn $1.
+# The text is compared first. A prompt that differs is still accepted when it
+# is not one of Claude Code's own injected notifications, in case a future
+# release rewrites submitted text.
+is_driver_prompt() {
+  local i=$1 key=$2 source=$3
+  case $source in '' | user) ;; *) return 1 ;; esac
+  [ "$key" != "${TURN_KEY[i]:-}" ] || return 0
+  case $key in '<task-notification>'* | '<'*'-notification>'*) return 1 ;; esac
+  warn "turn $i: the accepted prompt text differs from the one sent"
+  return 0
+}
+
+complete_turn() {
+  local i=$1
+  TURN_STATUS[i]=$2
+  TURN_ERROR[i]=$3
+  TURN_FINISHED_AT[i]=$(iso_now)
+  TURN_DURATION[i]=$((SECONDS - ${TURN_T0[i]:-$SECONDS}))
+}
+
+submit_turn() {
+  local i=$1
+  CUR_TURN=$i
+  TURN_STATE=submitting
+  TURN_SUBMITTED_AT[i]=$(iso_now)
+  TURN_T0[i]=$SECONDS
+  TURN_STATUS[i]=running
+  SUBMIT_T0=$SECONDS
+  SUBMIT_RETRIED=0
+  if [ "$i" -gt 1 ] || [ "$FIRST_PROMPT_MODE" = paste ]; then
+    log "Submitting turn $i/$TURN_COUNT"
+    paste_prompt "$i"
+  else
+    log "Turn 1/$TURN_COUNT is passed on the command line"
+  fi
+}
+
+# --- Main loop ---------------------------------------------------------------
+drive() {
+  local state screen hash last_hash="" idle_t0=$SECONDS stable=0 dead pstatus fatal deadline
+  deadline=$((RUN_T0 + TIMEOUT))
+  DIALOG_KEY_HASH=""
+  DIALOG_KEY_AT=0
+  DIALOG_MOVES=0
+  TURN_DONE_AT=0
+  EXIT_T0=0
+
+  if [ "$FIRST_PROMPT_MODE" = argv ]; then
+    submit_turn 1
+  else
+    CUR_TURN=1
+    TURN_STATE=await_ready
+    TURN_T0[1]=$SECONDS
+  fi
+
+  while :; do
+    ingest_events
+    [ -z "$FINAL_STATUS" ] || return 0
+
+    state=$(pane_state)
+    dead=${state%% *}
+    pstatus=${state#* }
+    screen=$(capture_screen)
+    hash=$(printf '%s' "$screen" | cksum)
+    if [ "$hash" != "$last_hash" ]; then
+      idle_t0=$SECONDS
+      stable=0
+    else
+      stable=$((stable + 1))
+    fi
+    last_hash=$hash
+
+    if [ "$dead" = 1 ]; then
+      ingest_events
+      CLAUDE_EXIT_STATUS=$pstatus
+      if [ "$TURN_STATE" = exiting ]; then
+        return 0
+      fi
+      [ -z "$FINAL_STATUS" ] || return 0
+      # tmux scrolls the pane to print its "Pane is dead" notice, so the
+      # visible screen can miss the first lines; use the scrollback instead.
+      screen=$(capture_history)
+      if fatal=$(match_fatal "$screen"); then
+        finish auth_failed "Claude Code exited: $fatal"
+      else
+        finish claude_exited "Claude Code exited with status ${pstatus:-unknown} during turn $CUR_TURN: $(screen_tail "$screen")"
+      fi
+      [ -z "${TURN_STATUS[CUR_TURN]:-}" ] || [ "${TURN_STATUS[CUR_TURN]}" != running ] ||
+        complete_turn "$CUR_TURN" failed "claude exited"
+      return 0
+    fi
+
+    # Startup: nothing has been accepted yet, so dialogs may be in the way.
+    if [ "$CUR_TURN" = 1 ] && { [ "$TURN_STATE" = await_ready ] || [ "$TURN_STATE" = submitting ]; }; then
+      if fatal=$(match_fatal "$screen"); then
+        finish auth_failed "authentication problem during startup: $fatal"
+        return 0
+      fi
+      if handle_dialogs "$screen" "$hash"; then
+        [ -z "$FINAL_STATUS" ] || return 0
+      elif [ "$TURN_STATE" = await_ready ] && [ "$SESSION_STARTED" = 1 ] &&
+        { [ "$stable" -ge 2 ] || [ $((SECONDS - SESSION_STARTED_AT)) -ge 5 ]; }; then
+        submit_turn 1
+      fi
+      if [ $((SECONDS - RUN_T0)) -ge "$STARTUP_TIMEOUT" ]; then
+        finish startup_failed "the first prompt was not accepted within ${STARTUP_TIMEOUT}s: $(screen_tail "$screen")"
+        return 0
+      fi
+    fi
+
+    case $TURN_STATE in
+      submitting)
+        # Turn 1 passed on the command line is covered by the startup timeout.
+        if [ "$CUR_TURN" -gt 1 ] || [ "$FIRST_PROMPT_MODE" = paste ]; then
+          if [ "$SUBMIT_RETRIED" = 0 ] && [ $((SECONDS - SUBMIT_T0)) -ge 15 ]; then
+            warn "turn $CUR_TURN not accepted after 15s, pressing Enter again"
+            send_keys Enter
+            SUBMIT_RETRIED=1
+          elif [ $((SECONDS - SUBMIT_T0)) -ge "$SUBMIT_TIMEOUT" ]; then
+            complete_turn "$CUR_TURN" failed "not accepted"
+            finish submit_failed "turn $CUR_TURN was not accepted within ${SUBMIT_TIMEOUT}s: $(screen_tail "$screen")"
+            return 0
+          fi
+        fi
+        ;;
+      running | background)
+        if [ "$TURN_TIMEOUT" -gt 0 ] && [ $((SECONDS - TURN_T0[CUR_TURN])) -ge "$TURN_TIMEOUT" ]; then
+          complete_turn "$CUR_TURN" timeout "turn timeout"
+          finish timeout "turn $CUR_TURN did not finish within ${TURN_TIMEOUT}s${TURN_STATE:+ (state $TURN_STATE)}"
+          return 0
+        fi
+        # A screen that sits still while background tasks run is expected.
+        if [ "$TURN_STATE" = running ] && [ "$IDLE_TIMEOUT" -gt 0 ] && [ $((SECONDS - idle_t0)) -ge "$IDLE_TIMEOUT" ]; then
+          complete_turn "$CUR_TURN" timeout "screen frozen"
+          finish timeout "the screen did not change for ${IDLE_TIMEOUT}s during turn $CUR_TURN: $(screen_tail "$screen")"
+          return 0
+        fi
+        ;;
+      done)
+        # Settle before moving on: Claude Code may resume the turn on its own
+        # right after a Stop (see the UserPromptSubmit handler), and other
+        # Stop hooks may still be running.
+        if [ $((SECONDS - TURN_DONE_AT)) -ge "$DONE_SETTLE" ]; then
+          if [ "$CUR_TURN" -lt "$TURN_COUNT" ]; then
+            submit_turn $((CUR_TURN + 1))
+          elif [ "$KEEP_SESSION" = 1 ]; then
+            return 0
+          else
+            log "All turns finished, exiting Claude Code"
+            send_keys -l '/exit'
+            sleep 0.3
+            send_keys Enter
+            TURN_STATE=exiting
+            EXIT_T0=$SECONDS
+          fi
+        fi
+        ;;
+      exiting)
+        handle_exit_dialogs "$screen" "$hash" || true
+        if [ $((SECONDS - EXIT_T0)) -ge 20 ]; then
+          warn "Claude Code did not exit within 20s, stopping it"
+          return 0
+        fi
+        ;;
+    esac
+
+    if [ "$SECONDS" -ge "$deadline" ] && [ "$TURN_STATE" != exiting ]; then
+      if [ "${TURN_STATUS[CUR_TURN]:-}" = running ]; then
+        complete_turn "$CUR_TURN" timeout "run timeout"
+      fi
+      finish timeout "the run did not finish within ${TIMEOUT}s (turn $CUR_TURN, state $TURN_STATE): $(screen_tail "$screen")"
+      return 0
+    fi
+    sleep "$POLL_INTERVAL"
+  done
+}
+
+# --- Report --------------------------------------------------------------------
+write_turn_records() {
+  local i=1 resp
+  : >"$INTERNAL_DIR/turns.jsonl"
+  while [ "$i" -le "$TURN_COUNT" ]; do
+    resp=$(turn_file "$i" response.txt)
+    [ -f "$resp" ] || resp=/dev/null
+    jq -nc \
+      --argjson index "$i" \
+      --arg status "${TURN_STATUS[i]:-not_started}" \
+      --arg prompt_id "${TURN_PROMPT_ID[i]:-}" \
+      --arg prompt_file "turns/$(printf '%02d' "$i").prompt.txt" \
+      --arg submitted_at "${TURN_SUBMITTED_AT[i]:-}" \
+      --arg started_at "${TURN_STARTED_AT[i]:-}" \
+      --arg finished_at "${TURN_FINISHED_AT[i]:-}" \
+      --arg duration "${TURN_DURATION[i]:-}" \
+      --arg error "${TURN_ERROR[i]:-}" \
+      --rawfile response "$resp" \
+      'def nn: if . == "" then null else . end;
+       {index: $index, status: $status, prompt_id: ($prompt_id | nn),
+        prompt_file: $prompt_file, submitted_at: ($submitted_at | nn),
+        started_at: ($started_at | nn), finished_at: ($finished_at | nn),
+        duration_seconds: ($duration | nn | if . == null then null else tonumber end),
+        error: ($error | nn), last_assistant_message: ($response | nn)}' \
+      >>"$INTERNAL_DIR/turns.jsonl"
+    i=$((i + 1))
+  done
+}
+
+# Totals come from the "cost-state" entries Claude Code writes into the
+# transcript. That format is internal, so a missing or changed entry only
+# leaves usage at null.
+extract_usage() {
+  local t=$OUT_DIR/transcript.jsonl u
+  [ -f "$t" ] || { echo null; return 0; }
+  # A malformed line stops jq early; keep whatever valid entry came before it.
+  u=$(jq -c 'select(.type == "cost-state")
+             | {total_cost_usd: .totalCostUSD, api_duration_ms: .totalAPIDuration,
+                lines_added: .totalLinesAdded, lines_removed: .totalLinesRemoved,
+                model_usage: .modelUsage}' "$t" 2>/dev/null | tail -n 1) || true
+  if [ -n "$u" ] && printf '%s' "$u" | jq -e 'type == "object"' >/dev/null 2>&1; then
+    printf '%s\n' "$u"
+  else
+    echo null
+  fi
+}
+
+finalize() {
+  [ "$FINALIZED" = 0 ] || return 0
+  FINALIZED=1
+  local final_msg_src="" i usage exit_code finished_at
+
+  if [ "$TMUX_STARTED" = 1 ]; then
+    capture_history >"$OUT_DIR/screen.txt" || true
+    if [ -z "$CLAUDE_EXIT_STATUS" ] && [ -f "$INTERNAL_DIR/claude.exit" ]; then
+      CLAUDE_EXIT_STATUS=$(cat "$INTERNAL_DIR/claude.exit")
+    fi
+    # Pick up a SessionEnd event that may have landed during shutdown.
+    ingest_events || true
+    if [ "$KEEP_SESSION" = 1 ]; then
+      log "Session left running. Attach with: tmux -L $TMUX_SOCKET attach -t main"
+    else
+      stop_tmux
+    fi
+  fi
+
+  if [ -z "$FINAL_STATUS" ]; then
+    FINAL_STATUS=success
+    FINAL_REASON="all $TURN_COUNT turn(s) completed"
+  fi
+  # A turn the run failed in the middle of must not be reported as running.
+  i=1
+  while [ "$i" -le "$TURN_COUNT" ]; do
+    if [ "${TURN_STATUS[i]:-}" = running ]; then complete_turn "$i" failed "$FINAL_STATUS"; fi
+    i=$((i + 1))
+  done
+
+  if [ "$COPY_TRANSCRIPT" = 1 ] && [ -n "$TRANSCRIPT_PATH" ] && [ -f "$TRANSCRIPT_PATH" ]; then
+    cp "$TRANSCRIPT_PATH" "$OUT_DIR/transcript.jsonl" || warn "could not copy transcript"
+  fi
+
+  i=$TURN_COUNT
+  while [ "$i" -ge 1 ]; do
+    if [ "${TURN_STATUS[i]:-}" = completed ] && [ -s "$(turn_file "$i" response.txt)" ]; then
+      final_msg_src=$(turn_file "$i" response.txt)
+      break
+    fi
+    i=$((i - 1))
+  done
+  if [ -n "$final_msg_src" ]; then cp "$final_msg_src" "$OUT_DIR/final-message.txt"; else : >"$OUT_DIR/final-message.txt"; fi
+
+  write_turn_records
+  usage=$(extract_usage)
+  exit_code=$(status_exit_code "$FINAL_STATUS")
+  finished_at=$(iso_now)
+  jq -n \
+    --arg status "$FINAL_STATUS" \
+    --argjson exit_code "$exit_code" \
+    --arg reason "$FINAL_REASON" \
+    --arg version "$CI_VERSION" \
+    --arg run_id "$RUN_ID" \
+    --arg session_id "$SESSION_ID" \
+    --arg claude_version "$CLAUDE_VERSION" \
+    --arg workdir "$WORKDIR" \
+    --arg started_at "$STARTED_AT" \
+    --arg finished_at "$finished_at" \
+    --argjson duration "$((SECONDS - RUN_T0))" \
+    --arg claude_exit "${CLAUDE_EXIT_STATUS:-}" \
+    --arg session_end "$SESSION_END_REASON" \
+    --arg transcript "$(if [ -f "$OUT_DIR/transcript.jsonl" ]; then echo transcript.jsonl; fi)" \
+    --argjson usage "$usage" \
+    --slurpfile turns "$INTERNAL_DIR/turns.jsonl" \
+    --rawfile final "$OUT_DIR/final-message.txt" \
+    'def nn: if . == "" then null else . end;
+     {schema_version: 1, status: $status, exit_code: $exit_code, reason: $reason,
+      driver_version: $version, run_id: $run_id, session_id: ($session_id | nn),
+      claude_version: ($claude_version | nn), workdir: $workdir,
+      started_at: $started_at, finished_at: $finished_at, duration_seconds: $duration,
+      claude_exit_status: ($claude_exit | nn | if . == null then null else tonumber end),
+      session_end_reason: ($session_end | nn),
+      turns_total: ($turns | length),
+      turns_completed: ([$turns[] | select(.status == "completed")] | length),
+      turns: $turns, final_message: ($final | nn),
+      transcript: ($transcript | nn), usage: $usage}' >"$OUT_DIR/result.json"
+
+  if [ "$FINAL_STATUS" = success ]; then
+    log "Success: $FINAL_REASON"
+  else
+    log "FAILED ($FINAL_STATUS): $FINAL_REASON"
+    if [ "${GITHUB_ACTIONS:-}" = true ]; then
+      printf '::error title=claude-interactive %s::%s\n' "$FINAL_STATUS" "$(gha_escape "$FINAL_REASON")" >&2
+    fi
+  fi
+  log "Artifacts: $OUT_DIR"
+
+  if [ "$JSON_OUTPUT" = 1 ]; then
+    cat "$OUT_DIR/result.json"
+  elif [ -s "$OUT_DIR/final-message.txt" ]; then
+    cat "$OUT_DIR/final-message.txt"
+    printf '\n'
+  fi
+}
+
+on_signal() {
+  trap - INT TERM
+  finish interrupted "interrupted by signal"
+  finalize
+  exit 130
+}
+
+on_exit() {
+  local rc=$?
+  if [ "$FINALIZED" = 0 ] && [ -n "${OUT_DIR:-}" ] && [ -d "${INTERNAL_DIR:-/nonexistent}" ]; then
+    finish error "driver failed unexpectedly (exit $rc)"
+    finalize || true
+  fi
+  stop_tmux_if_needed
+}
+
+stop_tmux_if_needed() {
+  if [ "$KEEP_SESSION" != 1 ]; then stop_tmux; fi
+}
+
+cmd_run() {
+  init_run_state
+  parse_run_args "$@"
+  check_run_deps
+
+  SELF=$(self_path)
+  RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)-$$"
+  WORKDIR=${WORKDIR:-$PWD}
+  WORKDIR=$(physical_dir "$WORKDIR") || die_usage "workdir does not exist" run
+  if [ -z "$OUT_DIR" ]; then
+    OUT_DIR="${RUNNER_TEMP:-${TMPDIR:-/tmp}}"
+    OUT_DIR="${OUT_DIR%/}/claude-interactive/$RUN_ID"
+  fi
+  mkdir -p "$OUT_DIR" || die "cannot create output directory: $OUT_DIR"
+  OUT_DIR=$(physical_dir "$OUT_DIR")
+  [ "$OUT_DIR" != / ] || die_usage "refusing to use / as output directory" run
+  INTERNAL_DIR=$OUT_DIR/internal
+  EVENTS_DIR=$INTERNAL_DIR/events
+  # A reused output directory must not leak a previous run's responses or
+  # events into this report. Only files the driver itself creates are removed.
+  rm -rf "$OUT_DIR/turns" "$INTERNAL_DIR"
+  rm -f "$OUT_DIR/result.json" "$OUT_DIR/final-message.txt" "$OUT_DIR/screen.txt" \
+    "$OUT_DIR/transcript.jsonl" "$OUT_DIR/events.jsonl" "$OUT_DIR/driver.log"
+  mkdir -p "$OUT_DIR/turns" "$EVENTS_DIR/.seq" "$EVENTS_DIR/processed"
+  : >"$OUT_DIR/events.jsonl"
+  DRIVER_LOG=$OUT_DIR/driver.log
+  : >"$DRIVER_LOG"
+  TMUX_SOCKET="claude-interactive-$$-$RANDOM"
+
+  materialize_prompts
+  FIRST_PROMPT_MODE=argv
+  if [ "$(wc -c <"$(turn_file 1 prompt.txt)" | tr -d ' ')" -gt "$ARGV_PROMPT_LIMIT" ]; then
+    FIRST_PROMPT_MODE="paste"
+  fi
+  setup_dialog_rules
+  write_tmux_conf
+  write_settings
+  build_claude_args
+  write_launch_script
+
+  if [ "$PERMISSION_MODE" = bypassPermissions ] && [ "$(id -u)" = 0 ] && [ -z "${IS_SANDBOX:-}" ]; then
+    warn "running as root: Claude Code refuses bypassPermissions as root unless IS_SANDBOX=1 is set"
+  fi
+
+  if [ "$DRY_RUN" = 1 ]; then
+    printf 'Output directory: %s\n\n--- launch.sh ---\n' "$OUT_DIR"
+    cat "$INTERNAL_DIR/launch.sh"
+    printf '\n--- settings.json ---\n'
+    cat "$INTERNAL_DIR/settings.json"
+    exit 0
+  fi
+
+  CLAUDE_VERSION=$("$CLAUDE_BIN" --version 2>/dev/null | cgrep -E '[0-9]+\.[0-9]+' | head -n 1 || true)
+  STARTED_AT=$(iso_now)
+  RUN_T0=$SECONDS
+  trap on_signal INT TERM
+  trap on_exit EXIT
+
+  log "claude-interactive $CI_VERSION, ${CLAUDE_VERSION:-Claude Code version unknown}"
+  log "Workdir: $WORKDIR"
+  log "Turns: $TURN_COUNT, timeout ${TIMEOUT}s, permission mode $PERMISSION_MODE"
+  log "Watch live (read-only): tmux -L $TMUX_SOCKET attach -r -t main"
+
+  start_tmux
+  drive
+  finalize
+  trap - EXIT
+  exit "$(status_exit_code "$FINAL_STATUS")"
+}
+
+# =============================================================================
+# setup
+# =============================================================================
+
+usage_setup() {
+  cat <<'EOF'
+Usage: claude-interactive setup [options]
+
+Prepares the Claude Code configuration of the current user for unattended
+runs. Existing keys are kept; only these are added or overwritten:
+
+  .claude.json   hasCompletedOnboarding = true, theme (only when unset),
+                 projects[DIR].hasTrustDialogAccepted = true for each trusted
+                 directory
+  settings.json  skipDangerousModePermissionPrompt = true
+
+The files live in $CLAUDE_CONFIG_DIR when it is set, otherwise in ~/.claude.json
+and ~/.claude/settings.json.
+
+Options:
+      --trust DIR          Directory to mark as trusted (repeatable, default:
+                           the current directory).
+      --base-config FILE   JSON merged into .claude.json before the keys above,
+                           for example an exported config with account details.
+                           '-' reads stdin.
+      --force              Allow running outside CI (CI=true is not set).
+  -h, --help               Show this help.
+EOF
+}
+
+# Write JSON produced by a jq filter atomically, keeping the file private.
+jq_update_file() {
+  local file=$1 tmp
+  shift
+  mkdir -p "$(dirname "$file")"
+  [ -s "$file" ] || printf '{}\n' >"$file"
+  jq -e 'type == "object"' "$file" >/dev/null 2>&1 || die "$file does not contain a JSON object"
+  tmp=$(mktemp "$file.XXXXXX")
+  if ! jq "$@" "$file" >"$tmp"; then
+    rm -f "$tmp"
+    die "could not update $file"
+  fi
+  chmod 600 "$tmp"
+  mv -f "$tmp" "$file"
+}
+
+cmd_setup() {
+  local trust_dirs=() base="" force=0 d p paths_json='[]' config settings base_json='{}'
+  while [ $# -gt 0 ]; do
+    case $1 in
+      --trust) need_value "$@"; trust_dirs+=("$2"); shift 2 ;;
+      --base-config) need_value "$@"; base=$2; shift 2 ;;
+      --force) force=1; shift ;;
+      -h | --help) usage_setup; exit 0 ;;
+      *) die_usage "unknown argument: $1" setup ;;
+    esac
+  done
+  command -v jq >/dev/null 2>&1 || die "missing dependency: jq" 3
+  if [ "${CI:-}" != true ] && [ "$force" = 0 ]; then
+    die "setup changes your Claude Code configuration; outside CI pass --force" 2
+  fi
+  [ ${#trust_dirs[@]} -gt 0 ] || trust_dirs=("$PWD")
+
+  for d in "${trust_dirs[@]}"; do
+    [ -d "$d" ] || die "not a directory: $d" 2
+    # Trust both the path as given and its symlink-free form, since Claude
+    # Code may see either one (for example /tmp versus /private/tmp).
+    p=$(cd "$d" && pwd -L)
+    paths_json=$(printf '%s' "$paths_json" | jq -c --arg p "$p" '. + [$p]')
+    p=$(physical_dir "$d")
+    paths_json=$(printf '%s' "$paths_json" | jq -c --arg p "$p" '. + [$p] | unique')
+  done
+
+  if [ -n "$base" ]; then
+    if [ "$base" = - ]; then base_json=$(cat); else base_json=$(cat "$base"); fi
+    base_json=$(printf '%s' "$base_json" | jq -c 'if type == "object" then . else error("not an object") end') ||
+      die "--base-config must contain a JSON object" 2
+  fi
+
+  config=$(claude_config_file)
+  settings=$(claude_settings_file)
+  umask 077
+  # shellcheck disable=SC2016 # jq program, not shell
+  jq_update_file "$config" --argjson base "$base_json" --argjson paths "$paths_json" '
+    (. * $base)
+    | .hasCompletedOnboarding = true
+    | .theme = (.theme // "dark")
+    | reduce $paths[] as $p (.;
+        .projects[$p] = ((.projects[$p] // {}) + {hasTrustDialogAccepted: true, hasCompletedProjectOnboarding: true}))'
+  jq_update_file "$settings" '.skipDangerousModePermissionPrompt = true'
+  printf 'Updated %s\n' "$config"
+  printf 'Updated %s\n' "$settings"
+  printf 'Trusted: %s\n' "$(printf '%s' "$paths_json" | jq -r 'join(", ")')"
+}
+
+# =============================================================================
+# doctor
+# =============================================================================
+
+cmd_doctor() {
+  local ok=1 c v bin config v_tmux
+  case ${1:-} in -h | --help) echo "Usage: claude-interactive doctor"; exit 0 ;; esac
+  printf 'claude-interactive %s\n' "$CI_VERSION"
+  printf 'bash        %s\n' "$BASH_VERSION"
+  for c in tmux jq; do
+    if command -v "$c" >/dev/null 2>&1; then
+      case $c in tmux) v=$(tmux -V) ;; jq) v=$(jq --version) ;; esac
+      printf '%-11s %s\n' "$c" "$v"
+    else
+      printf '%-11s MISSING\n' "$c"
+      ok=0
+    fi
+  done
+  if command -v tmux >/dev/null 2>&1; then
+    v_tmux=$(tmux -V | sed 's/[^0-9.]*\([0-9][0-9]*\)\..*/\1/')
+    if is_uint "$v_tmux" && [ "$v_tmux" -lt 3 ]; then
+      printf 'WARN        tmux 3.0 or newer is recommended\n'
+    fi
+  fi
+  bin=${CLAUDE_BIN:-claude}
+  if command -v "$bin" >/dev/null 2>&1; then
+    printf 'claude      %s (%s)\n' "$("$bin" --version 2>/dev/null | head -n 1)" "$(command -v "$bin")"
+  else
+    printf 'claude      MISSING (%s)\n' "$bin"
+    ok=0
+  fi
+  config=$(claude_config_file)
+  if [ -f "$config" ]; then
+    printf 'config      %s (onboarding done: %s)\n' "$config" \
+      "$(jq -r '.hasCompletedOnboarding // false' "$config" 2>/dev/null || echo unreadable)"
+  else
+    printf 'config      %s (missing: run "claude-interactive setup" on CI)\n' "$config"
+  fi
+  if [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]; then printf 'auth        CLAUDE_CODE_OAUTH_TOKEN is set\n'; fi
+  if [ -n "${ANTHROPIC_API_KEY:-}" ]; then printf 'auth        ANTHROPIC_API_KEY is set (takes precedence, may show a confirmation dialog)\n'; fi
+  if [ -z "${CLAUDE_CODE_OAUTH_TOKEN:-}${ANTHROPIC_API_KEY:-}" ]; then
+    printf 'auth        no token in the environment, relying on a stored login\n'
+  fi
+  if [ -n "${CLAUDECODE:-}" ]; then
+    printf 'note        running inside a Claude Code session; run strips the parent session variables\n'
+  fi
+  [ "$ok" = 1 ] || exit 3
+}
+
+# =============================================================================
+# main
+# =============================================================================
+
+usage_main() {
+  cat <<'EOF'
+Usage: claude-interactive <command> [options]
+
+Commands:
+  run       Start Claude Code in tmux, submit one or more prompts, wait for
+            each turn to finish, exit, and write a result report.
+  setup     Prepare Claude Code's config for unattended runs (CI).
+  doctor    Check dependencies and environment.
+  version   Print the version.
+  help      Show this help.
+
+Run 'claude-interactive <command> --help' for the options of a command.
+EOF
+}
+
+main() {
+  CMD=${1:-}
+  [ $# -eq 0 ] || shift
+  case $CMD in
+    run) cmd_run "$@" ;;
+    setup) cmd_setup "$@" ;;
+    doctor) cmd_doctor "$@" ;;
+    version | --version | -V) printf 'claude-interactive %s\n' "$CI_VERSION" ;;
+    help | --help | -h | '') usage_main ;;
+    *) die_usage "unknown command: $CMD" ;;
+  esac
+}
+
+main "$@"

@@ -1,0 +1,52 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+    paths-ignore: ['log.txt', 'REPORT.md']
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  shellcheck:
+    runs-on: ubuntu-latest
+    env:
+      SHELLCHECK_VERSION: v0.11.0
+    steps:
+      - uses: actions/checkout@v4
+      # Pinned: the runner's preinstalled shellcheck is older and reports
+      # different findings than the version used locally.
+      - name: Install shellcheck ${{ env.SHELLCHECK_VERSION }}
+        run: |
+          curl -fsSL "https://github.com/koalaman/shellcheck/releases/download/${SHELLCHECK_VERSION}/shellcheck-${SHELLCHECK_VERSION}.linux.x86_64.tar.xz" |
+            tar -xJ -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/shellcheck-${SHELLCHECK_VERSION}" >> "$GITHUB_PATH"
+      - name: Run shellcheck
+        run: |
+          shellcheck --version
+          shellcheck -x bin/claude-interactive scripts/*.sh tests/run.sh .githooks/pre-commit
+
+  test:
+    # Offline tests against a fake Claude Code TUI (tests/fake-claude). macOS
+    # runs them with the system bash 3.2, Ubuntu with bash 5.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install tmux and jq
+        run: |
+          if [ "$RUNNER_OS" = Linux ]; then
+            sudo apt-get update -qq && sudo apt-get install -y -qq tmux jq
+          else
+            brew install tmux jq
+          fi
+          tmux -V
+          jq --version
+      - name: Run tests
+        run: /bin/bash tests/run.sh

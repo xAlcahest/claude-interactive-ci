@@ -13,217 +13,65 @@ on:
 permissions:
   contents: write
 
+# Two runs pushing to log.txt at the same time would conflict.
+concurrency:
+  group: claude-interactive-cron
+  cancel-in-progress: false
+
 jobs:
   interactive-claude:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Install dependencies
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq tmux jq
-
-      - name: Install Claude Code
-        run: |
-          npm install -g @anthropic-ai/claude-code@latest
-          claude --version
-
-      - name: Configure Claude auth and bypass all dialogs
-        env:
-          CLAUDE_ONBOARDING_JSON: ${{ secrets.CLAUDE_ONBOARDING_JSON }}
-        run: |
-          # Mark the workspace as trusted up front so the trust dialog never shows up.
-          WORKSPACE=$(realpath "$GITHUB_WORKSPACE")
-          if ! printf '%s' "$CLAUDE_ONBOARDING_JSON" | jq -e --arg ws "$WORKSPACE" \
-              '.projects[$ws] = ((.projects[$ws] // {}) + {hasTrustDialogAccepted: true})' > ~/.claude.json; then
-            echo "::error::CLAUDE_ONBOARDING_JSON secret is empty or not valid JSON"
-            exit 1
-          fi
-          mkdir -p ~/.claude
-          echo '{"skipDangerousModePermissionPrompt": true}' > ~/.claude/settings.json
-          echo "Auth and onboarding configured"
-
       - name: Build prompt
-        id: prompt
+        env:
+          # Passed through the environment, never interpolated into the script.
+          CUSTOM_PROMPT: ${{ github.event.inputs.custom_prompt }}
+          RUN_NUMBER: ${{ github.run_number }}
         run: |
-          CUSTOM="${{ github.event.inputs.custom_prompt }}"
           TIMESTAMP=$(date -u '+%Y-%m-%d %H:%M:%S UTC')
-          RUN_NUMBER="${{ github.run_number }}"
-
-          if [ -n "$CUSTOM" ]; then
-            PROMPT="$CUSTOM"
+          if [ -n "$CUSTOM_PROMPT" ]; then
+            PROMPT="$CUSTOM_PROMPT"
           else
             PROMPT="You are a helpful maintenance bot. Please: 1) Check the current date and system uptime using bash. 2) Read log.txt and count how many entries it has so far. 3) Create a file called REPORT.md containing a brief system health report with the date, uptime, and entry count. 4) Add a new entry to log.txt in the format: Run #${RUN_NUMBER} — ${TIMESTAMP} — followed by a short software engineering observation. Save all files."
           fi
+          printf '%s' "$PROMPT" > "$RUNNER_TEMP/claude-prompt.txt"
 
-          echo "$PROMPT" > /tmp/claude-prompt.txt
-          echo "prompt_file=/tmp/claude-prompt.txt" >> "$GITHUB_OUTPUT"
+      - name: Run Claude Code interactively
+        id: claude
+        uses: ./
+        with:
+          prompt-files: ${{ runner.temp }}/claude-prompt.txt
+          oauth-token: ${{ secrets.CLAUDE_OAUTH_TOKEN }}
+          base-config: ${{ secrets.CLAUDE_ONBOARDING_JSON }}
+          # Pinned on purpose: dialogs and keybindings change between releases.
+          claude-version: '2.1.314'
+          timeout: '600'
+          artifact-name: claude-session-logs
 
-      - name: Run Claude Code interactively via tmux
-        env:
-          TERM: xterm-256color
-          ANTHROPIC_API_KEY: ""
-          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_OAUTH_TOKEN }}
-          IS_SANDBOX: "1"
+      - name: Check that log.txt was updated
         run: |
-          set +e
-
-          SESSION="claude-ci-$$"
-          PROMPT=$(cat "${{ steps.prompt.outputs.prompt_file }}")
-          TIMEOUT=180
-
-          tmux new-session -d -s "$SESSION" -x 200 -y 50 \
-            "cd $GITHUB_WORKSPACE && export CLAUDE_CODE_OAUTH_TOKEN='${CLAUDE_CODE_OAUTH_TOKEN}' && export IS_SANDBOX=1 && claude --dangerously-skip-permissions --verbose; echo __CLAUDE_EXITED__; bash"
-
-          # Pick a menu entry by its label, not by its position. Claude Code reorders
-          # these dialogs between releases (2.1.250 put "No, exit" first and made it
-          # the default), so typed digits or a blind Enter can decline the dialog.
-          select_option() {
-            if echo "$BUFFER" | grep -qE "❯ +$1"; then
-              tmux send-keys -t "$SESSION" Enter
-            else
-              tmux send-keys -t "$SESSION" Down
-            fi
-          }
-
-          echo "Waiting for Claude Code..."
-          sleep 10
-          INIT_WAIT=10
-          READY=0
-          while [ $INIT_WAIT -lt 90 ]; do
-            BUFFER=$(tmux capture-pane -t "$SESSION" -p 2>/dev/null || true)
-
-            # Claude quit (e.g. a dialog got declined): stop here, otherwise every
-            # further keystroke lands in the fallback shell.
-            if echo "$BUFFER" | grep -q "__CLAUDE_EXITED__"; then
-              echo "::error::Claude Code exited during startup"
-              echo "$BUFFER"
-              tmux kill-session -t "$SESSION" 2>/dev/null || true
-              exit 1
-            fi
-
-            # Trust dialog (normally skipped, the workspace is pre-trusted in ~/.claude.json)
-            if echo "$BUFFER" | grep -q "Yes, I trust this folder"; then
-              echo "Trust dialog detected, selecting \"Yes, I trust this folder\"..."
-              select_option "Yes, I trust this folder"
-              sleep 1
-              INIT_WAIT=$((INIT_WAIT + 1))
-              continue
-            fi
-
-            # Bypass permissions confirmation (normally skipped via skipDangerousModePermissionPrompt)
-            if echo "$BUFFER" | grep -q "Yes, I accept"; then
-              echo "Bypass permissions dialog detected, selecting \"Yes, I accept\"..."
-              select_option "Yes, I accept"
-              sleep 1
-              INIT_WAIT=$((INIT_WAIT + 1))
-              continue
-            fi
-
-            # Ready to go
-            if echo "$BUFFER" | grep -qE '(Enter a prompt|tips:|bypass permissions on)'; then
-              echo "Claude Code is ready (after ${INIT_WAIT}s)"
-              READY=1
-              break
-            fi
-
-            # Login wizard = onboarding bypass failed
-            if echo "$BUFFER" | grep -q "Select login method"; then
-              echo "::error::Login wizard appeared — onboarding bypass failed"
-              tmux capture-pane -t "$SESSION" -p
-              tmux kill-session -t "$SESSION" 2>/dev/null || true
-              exit 1
-            fi
-
-            sleep 3
-            INIT_WAIT=$((INIT_WAIT + 3))
-          done
-
-          if [ $READY -ne 1 ]; then
-            echo "::error::Claude Code did not become ready within ${INIT_WAIT}s"
-            tmux capture-pane -t "$SESSION" -p
-            tmux kill-session -t "$SESSION" 2>/dev/null || true
+          if git diff --quiet log.txt; then
+            echo "::error::Claude finished but log.txt was not modified"
             exit 1
           fi
-
-          echo "Sending prompt..."
-          tmux send-keys -t "$SESSION" "$PROMPT"
-          sleep 0.3
-          tmux send-keys -t "$SESSION" C-m
-
-          echo "Waiting for Claude Code to complete..."
-          ELAPSED=0
-          LAST_HASH=""
-          STABLE=0
-
-          while [ $ELAPSED -lt $TIMEOUT ]; do
-            sleep 3
-            ELAPSED=$((ELAPSED + 3))
-
-            BUFFER=$(tmux capture-pane -t "$SESSION" -p 2>/dev/null || true)
-            CURRENT_HASH=$(echo "$BUFFER" | md5sum | cut -d' ' -f1)
-
-            if [ "$CURRENT_HASH" = "$LAST_HASH" ]; then
-              STABLE=$((STABLE + 1))
-              if [ $STABLE -ge 4 ]; then
-                echo "Output stable for 12s — Claude Code appears done (${ELAPSED}s total)"
-                break
-              fi
-            else
-              STABLE=0
-            fi
-            LAST_HASH="$CURRENT_HASH"
-
-            if [ $((ELAPSED % 15)) -eq 0 ]; then
-              echo "  ... still working (${ELAPSED}s)"
-            fi
-          done
-
-          echo "=== Final tmux buffer ==="
-          tmux capture-pane -t "$SESSION" -p -S -200 | tee /tmp/claude-output.txt
-          echo "========================="
-
-          tmux send-keys -t "$SESSION" "/exit" C-m
-          sleep 2
-          tmux kill-session -t "$SESSION" 2>/dev/null || true
-
-          if git diff --quiet log.txt REPORT.md 2>/dev/null; then
-            # Fail the job: a green run that wrote nothing hides problems like auth errors.
-            echo "::error::log.txt was not modified"
-            AUTH_ERR=$(grep -m1 -E 'disabled Claude subscription access|Invalid API key|OAuth token|authentication_error|Not logged in' /tmp/claude-output.txt | sed -E 's/^[^A-Za-z]+//')
-            if [ -n "$AUTH_ERR" ]; then
-              echo "::error::Claude Code auth problem: $AUTH_ERR"
-            fi
-            echo "result=failure" >> "$GITHUB_ENV"
-            exit 1
-          else
-            echo "=== log.txt content ==="
-            cat log.txt
-            echo "========================"
-            echo "result=success" >> "$GITHUB_ENV"
-          fi
+          tail -n 3 log.txt
 
       - name: Commit changes
-        if: env.result == 'success'
+        env:
+          RUN_NUMBER: ${{ github.run_number }}
         run: |
           git config user.name "claude-interactive-bot"
           git config user.email "bot@example.com"
-          git add log.txt REPORT.md 2>/dev/null || git add log.txt
+          git add log.txt
+          if [ -f REPORT.md ]; then git add REPORT.md; fi
           if git diff --cached --quiet; then
             echo "No changes to commit"
           else
-            git commit -m "log: entry added by interactive Claude session (run #${{ github.run_number }})"
+            git commit -m "log: entry added by interactive Claude session (run #${RUN_NUMBER})"
             git push
           fi
-
-      - name: Upload logs
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: claude-session-logs
-          path: /tmp/claude-output.txt
-          retention-days: 7
