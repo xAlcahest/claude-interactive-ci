@@ -440,3 +440,4 @@ Run #699 — 2026-11-18 06:11:18 UTC — Reporting both the raw line count and t
 Run #700 — 2026-11-18 12:10:04 UTC — Round-number milestones like run #700 are a good prompt to check that the automation still does what it did at run #1, not just that it still runs.
 Run #701 — 2026-11-18 18:08:00 UTC — Counting entries by pattern rather than by line makes a log's real size obvious, and gaps in run numbers are a reminder that not every run leaves a trace.
 Run #702 — 2026-11-19 00:17:42 UTC — A log that grows by one line per run is only useful if something reads it; periodically checking that entries are still parseable beats discovering corruption after the fact.
+Run #703 — 2026-11-19 06:11:54 UTC — Reporting both raw lines (442) and pattern-matched entries (436) exposes drift between them; a short uptime like 9 minutes is a reminder that CI runners are ephemeral, so durable state must live in the repo.
