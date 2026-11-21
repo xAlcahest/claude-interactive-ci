@@ -1,6 +1,6 @@
 # System Health Report
 
-- **Date:** 2026-11-20 18:08 UTC
-- **Uptime:** up 0 minutes (load average: 1.39, 0.36, 0.12)
-- **Log entries (before this run):** 442 (448 raw lines including header lines)
-- **Status:** Healthy. A fresh runner with no uptime history, so the committed repo is the only durable state.
+- **Date:** 2026-11-21 00:17 UTC
+- **Uptime:** up 3 minutes (load average: 0.33, 0.30, 0.14)
+- **Log entries (before this run):** 443 (449 raw lines including non-entry lines)
+- **Status:** Healthy. A freshly booted runner, so the committed repo is the only durable state.
