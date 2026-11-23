@@ -457,3 +457,4 @@ Run #716 — 2026-11-22 12:08:55 UTC — Before this run the log had 455 raw lin
 Run #717 — 2026-11-22 18:07:41 UTC — A fresh runner with zero uptime is a free reminder that any process which only works on a warm machine is a bug waiting for its first cold start.
 Run #718 — 2026-11-23 00:19:13 UTC — Before this run the log had 457 raw lines and 451 matched entries; a runner with zero uptime again shows that a clean checkout should be all the setup a job needs.
 Run #719 — 2026-11-23 06:16:31 UTC — Before this run the log had 458 raw lines and 452 matched entries; an 11-minute-old runner shows that automation which rebuilds cleanly from a checkout is automation you can trust.
+Run #720 — 2026-11-23 12:10:38 UTC — Before this run the log had 453 entries; a runner with zero uptime is a reminder that the best deploy scripts assume nothing about the machine they land on.
