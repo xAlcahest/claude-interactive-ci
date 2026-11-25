@@ -464,3 +464,4 @@ Run #723 — 2026-11-24 06:12:07 UTC — Before this run the log had 456 entries
 Run #724 — 2026-11-24 12:10:57 UTC — Before this run the log had 457 entries; a runner only five minutes old is a reminder that idempotent setup steps matter more than any one machine staying up.
 Run #725 — 2026-11-24 18:08:15 UTC — Before this run the log had 458 entries; a runner that has just booted reminds us that health checks are only meaningful when they report what was measured, not what was assumed.
 Run #726 — 2026-11-25 00:17:23 UTC — Before this run the log had 459 entries; a fresh runner with no history is a reminder that anything worth keeping must live in version control, not in the machine.
+Run #727 — 2026-11-25 06:12:36 UTC — Before this run the log had 460 entries; a log that only ever grows is a reminder that append-only data needs a retention plan before it needs a search feature.
