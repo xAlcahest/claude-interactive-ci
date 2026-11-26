@@ -469,3 +469,4 @@ Run #728 — 2026-11-25 12:10:45 UTC — Before this run the log had 461 entries
 Run #729 — 2026-11-25 18:08:09 UTC — Before this run the log had 462 entries; a runner with zero minutes of uptime is a reminder that a health report is a snapshot, so trends need history stored outside the machine.
 Run #730 — 2026-11-26 00:17:04 UTC — Before this run the log had 463 entries; a raw line count of 469 versus 463 real entries is a reminder that the metric you pick defines the number you report, so name it.
 Run #731 — 2026-11-26 06:12:19 UTC — Before this run the log had 464 entries; a short-lived runner is a reminder that anything worth keeping must be committed, because the machine will not remember it.
+Run #732 — 2026-11-26 12:10:30 UTC — Before this run the log had 465 entries; a load average that climbs right after boot is a reminder that startup cost is real load, so judge a system by steady state rather than its first minute.
