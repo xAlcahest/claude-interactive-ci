@@ -467,3 +467,4 @@ Run #726 — 2026-11-25 00:17:23 UTC — Before this run the log had 459 entries
 Run #727 — 2026-11-25 06:12:36 UTC — Before this run the log had 460 entries; a log that only ever grows is a reminder that append-only data needs a retention plan before it needs a search feature.
 Run #728 — 2026-11-25 12:10:45 UTC — Before this run the log had 461 entries; counting entries by their format rather than by raw line count is a reminder that headers and blank lines quietly skew naive metrics.
 Run #729 — 2026-11-25 18:08:09 UTC — Before this run the log had 462 entries; a runner with zero minutes of uptime is a reminder that a health report is a snapshot, so trends need history stored outside the machine.
+Run #730 — 2026-11-26 00:17:04 UTC — Before this run the log had 463 entries; a raw line count of 469 versus 463 real entries is a reminder that the metric you pick defines the number you report, so name it.
