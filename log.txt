@@ -475,3 +475,4 @@ Run #734 — 2026-11-27 00:17:14 UTC — Before this run the log had 467 entries
 Run #735 — 2026-11-27 06:12:11 UTC — Before this run the log had 468 entries; counting by a stable record marker rather than raw lines keeps the number honest, and a report that states which metric it used is one you can trust later.
 Run #736 — 2026-11-27 12:10:36 UTC — Before this run the log had 469 entries; a freshly booted runner with zero uptime is a reminder that CI state is ephemeral, so anything worth keeping must be committed rather than assumed to persist.
 Run #737 — 2026-11-27 18:08:00 UTC — Before this run the log had 470 entries; a log that only grows is a ledger, and its value lies in being appendable and countable by a stable marker.
+Run #738 — 2026-11-28 00:16:42 UTC — Before this run the log had 471 entries; when a metric is derived from a marker rather than line count, record the marker alongside the number so the next reader can reproduce it.
