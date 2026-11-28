@@ -1,7 +1,6 @@
 # System Health Report
 
-- **Date:** 2026-11-28 06:10:47 UTC
-- **Uptime:** up 5 minutes (load average: 0.50, 0.18, 0.07)
-- **Log entries:** 472 (counted by lines starting with `Run #`; the file has 478 lines in total, 6 of them non-entry lines)
-
-Status: healthy. The runner has just booted and load is low.
+- **Date:** 2026-11-28 12:09 UTC
+- **Uptime:** up 0 minutes (freshly booted runner), load average 0.83 / 0.21 / 0.07
+- **Log entries:** 473 before this run (counted by the `Run #` marker; log.txt has 479 lines, 6 of them header or blank lines)
+- **Status:** Healthy
